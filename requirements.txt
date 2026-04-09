@@ -1,0 +1,14 @@
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+pydantic-settings==2.2.1
+supabase==2.7.4
+sqlmodel==0.0.16
+python-dotenv==1.0.1
+facebook-business==19.0.2
+celery==5.3.6
+redis==5.0.1
+httpx>=0.24.0
+pytest==8.0.2
+alembic==1.13.1
+websockets>=12.0
+
