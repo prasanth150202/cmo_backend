@@ -215,24 +215,26 @@ def _fetch_daily_from_meta(date_from: str, date_to: str, brand_id: Optional[str]
 
 def _fetch_account_totals(date_from: str, date_to: str) -> dict:
     """
-    Returns spend/revenue/conversions totals keyed by account_id.
+    Returns spend/revenue/conversions/clicks totals keyed by account_id.
     Reads from local daily_metrics first; falls back to Meta API.
     """
     rows = _read_daily_metrics(date_from, date_to)
 
     if rows:
-        totals: dict = defaultdict(lambda: {"spend": 0.0, "revenue": 0.0, "conversions": 0.0})
+        totals: dict = defaultdict(lambda: {"spend": 0.0, "revenue": 0.0, "conversions": 0.0, "clicks": 0})
         for r in rows:
             aid = str(r["account_id"])
             totals[aid]["spend"] += float(r.get("spend") or 0)
             totals[aid]["revenue"] += float(r.get("revenue") or 0)
             totals[aid]["conversions"] += float(r.get("conversions") or 0)
+            totals[aid]["clicks"] += int(r.get("clicks") or 0)
         result = {}
         for aid, t in totals.items():
             result[aid] = {
                 "spend": round(t["spend"], 2),
                 "revenue": round(t["revenue"], 2),
                 "conversions": round(t["conversions"], 1),
+                "clicks": t["clicks"],
                 "roas": round(t["revenue"] / t["spend"], 2) if t["spend"] > 0 else 0.0,
             }
         return result

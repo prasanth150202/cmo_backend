@@ -188,10 +188,13 @@ def get_brands_overview(
         # Normalize: strip act_ prefix so IDs match daily_metrics storage format
         account_ids = {a["account_id"].replace("act_", "") for a in brand_accounts}
 
+        target_roas = float(b.get("target_roas") or 3.0)
+
         if account_totals:
             spend = round(sum(account_totals.get(aid, {}).get("spend", 0) for aid in account_ids), 2)
             revenue = round(sum(account_totals.get(aid, {}).get("revenue", 0) for aid in account_ids), 2)
             conversions = round(sum(account_totals.get(aid, {}).get("conversions", 0) for aid in account_ids), 0)
+            clicks = sum(account_totals.get(aid, {}).get("clicks", 0) for aid in account_ids)
         else:
             has_account_id = supabase_metrics and "account_id" in supabase_metrics[0]
             if has_account_id:
@@ -201,8 +204,11 @@ def get_brands_overview(
             spend = round(sum(float(m.get("spend") or 0) for m in brand_metrics), 2)
             revenue = round(sum(float(m.get("revenue") or 0) for m in brand_metrics), 2)
             conversions = round(sum(float(m.get("conversions") or 0) for m in brand_metrics), 0)
+            clicks = sum(int(m.get("clicks") or 0) for m in brand_metrics)
 
         roas = round(revenue / spend, 2) if spend > 0 else 0
+        cvr = round(conversions / clicks * 100, 2) if clicks > 0 else 0
+        score = min(100, int((roas / target_roas) * 60 + min(cvr * 10, 40))) if roas > 0 else 0
 
         result.append({
             "brand_id": b["id"],
@@ -211,7 +217,7 @@ def get_brands_overview(
             "logo_url": b.get("logo_url"),
             "website_url": b.get("website_url"),
             "industry": b.get("industry", ""),
-            "target_roas": float(b.get("target_roas") or 3.0),
+            "target_roas": target_roas,
             "monthly_budget_cap": float(b.get("monthly_budget_cap") or 0),
             "accounts_count": len(brand_accounts),
             "metrics": {
@@ -219,6 +225,7 @@ def get_brands_overview(
                 "revenue": revenue,
                 "roas": roas,
                 "conversions": conversions,
+                "score": score,
             },
         })
     return result
