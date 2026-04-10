@@ -724,10 +724,13 @@ def get_adset_ads(
     except Exception:
         rows = []
 
-    if rows:
+    # Check if rows exist but are missing creative data (first sync had no creatives)
+    missing_creatives = rows and all(not r.get("ad_title") and not r.get("thumbnail_url") for r in rows)
+
+    if rows and not missing_creatives:
         return _aggregate_ad_rows(rows)
 
-    # 2. No DB data — find campaign_id + account_id then trigger background sync
+    # No rows OR rows exist but lack creative data — find parent IDs and re-sync
     try:
         adset_resp = (
             supabase.table("adset_daily_metrics")
@@ -745,12 +748,14 @@ def get_adset_ads(
 
     if account_id and background_tasks is not None:
         from app.services.ingest import IngestService
+        # skip_existing=False so it re-fetches creatives for all existing rows too
         background_tasks.add_task(
             IngestService.sync_ad_daily_metrics,
-            adset_id, campaign_id, account_id, date_from, date_to,
+            adset_id, campaign_id, account_id, date_from, date_to, False,
         )
 
-    return []
+    # Return whatever we have (metrics without creatives) while sync runs in background
+    return _aggregate_ad_rows(rows) if rows else []
 
 
 @router.post("/{brand_id}/adsets/{adset_id}/ads/sync")

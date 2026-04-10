@@ -558,50 +558,123 @@ class IngestService:
     @staticmethod
     def _fetch_ad_creatives(ad_ids: List[str]) -> Dict[str, Dict]:
         """
-        Batch-fetch creative details (title, body, type, thumbnail, CTA, link) for a list of ad IDs.
-        Returns a dict keyed by ad_id.
+        Fetch creative details for a list of ad IDs.
+        Strategy:
+          1. Fetch each Ad to get its creative_id.
+          2. Fetch the AdCreative directly with all fields.
+          3. Extract title/body from top-level OR object_story_spec (link/video/carousel).
         """
         from facebook_business.adobjects.ad import Ad
+        from facebook_business.adobjects.adcreative import AdCreative
+
+        CREATIVE_FIELDS = [
+            "title", "body", "object_type",
+            "thumbnail_url", "image_url",
+            "call_to_action_type", "link_url",
+            "object_story_spec",
+        ]
+
+        def _safe_dict(obj) -> dict:
+            """Export SDK object or return as-is if already a dict."""
+            if obj is None:
+                return {}
+            if hasattr(obj, "export_all_data"):
+                return obj.export_all_data() or {}
+            if isinstance(obj, dict):
+                return obj
+            return {}
+
+        def _extract_from_oss(oss: dict) -> tuple:
+            """Pull title, body, dest_url, cta from object_story_spec."""
+            title, body, dest_url, cta = "", "", "", ""
+
+            # Link ad
+            ld = _safe_dict(oss.get("link_data"))
+            if ld:
+                title    = title    or ld.get("name", "")
+                body     = body     or ld.get("message", "")
+                dest_url = dest_url or ld.get("link", "")
+                cta_obj  = _safe_dict(ld.get("call_to_action"))
+                cta      = cta      or cta_obj.get("type", "")
+                if not dest_url:
+                    dest_url = _safe_dict(cta_obj.get("value")).get("link", "")
+
+            # Video ad
+            vd = _safe_dict(oss.get("video_data"))
+            if vd:
+                title    = title    or vd.get("title", "")
+                body     = body     or vd.get("message", "")
+                cta_obj  = _safe_dict(vd.get("call_to_action"))
+                cta      = cta      or cta_obj.get("type", "")
+                if not dest_url:
+                    dest_url = _safe_dict(cta_obj.get("value")).get("link", "")
+
+            # Carousel (multi_share_data)
+            md = _safe_dict(oss.get("template_data") or oss.get("multi_share_data"))
+            if md:
+                body     = body     or md.get("message", "")
+                dest_url = dest_url or md.get("link", "")
+
+            return title, body, dest_url, cta
+
         creatives: Dict[str, Dict] = {}
+        empty = {
+            "ad_title": "", "ad_body": "", "creative_type": "",
+            "thumbnail_url": "", "image_url": "",
+            "call_to_action": "", "destination_url": "",
+        }
+
         for ad_id in ad_ids:
             try:
-                ad_obj = Ad(ad_id)
-                data = ad_obj.api_get(fields=[
-                    "name",
-                    "creative{title,body,object_type,thumbnail_url,image_url,call_to_action_type,link_url,object_story_spec}",
-                ])
-                raw = data.export_all_data() if hasattr(data, "export_all_data") else dict(data)
-                cr  = raw.get("creative") or {}
+                # Step 1: get creative ID from the Ad object
+                ad_obj  = Ad(ad_id)
+                ad_data = _safe_dict(ad_obj.api_get(fields=["creative"]))
+                cr_ref  = ad_data.get("creative") or {}
+                if hasattr(cr_ref, "export_all_data"):
+                    cr_ref = cr_ref.export_all_data() or {}
+                creative_id = cr_ref.get("id", "") if isinstance(cr_ref, dict) else ""
 
-                # creative_type: IMAGE, VIDEO, CAROUSEL, etc.
-                object_type = cr.get("object_type", "")
+                if not creative_id:
+                    print(f"[creative] no creative_id for ad {ad_id}")
+                    creatives[ad_id] = empty.copy()
+                    continue
 
-                # Thumbnail: prefer thumbnail_url, fallback to image_url
-                thumbnail = cr.get("thumbnail_url", "") or cr.get("image_url", "") or ""
+                # Step 2: fetch AdCreative directly
+                cr_obj  = AdCreative(creative_id)
+                cr_raw  = _safe_dict(cr_obj.api_get(fields=CREATIVE_FIELDS))
 
-                # Destination URL: from call_to_action or link_url
-                dest_url = cr.get("link_url", "")
-                oss = cr.get("object_story_spec") or {}
-                if not dest_url and oss:
-                    lk = oss.get("link_data") or oss.get("video_data") or {}
-                    dest_url = lk.get("link", "") or lk.get("call_to_action", {}).get("value", {}).get("link", "")
+                # Step 3: extract fields — top-level first, then object_story_spec
+                title    = cr_raw.get("title", "")
+                body     = cr_raw.get("body", "")
+                obj_type = cr_raw.get("object_type", "")
+                thumbnail = cr_raw.get("thumbnail_url", "") or cr_raw.get("image_url", "")
+                image_url = cr_raw.get("image_url", "") or thumbnail
+                cta       = cr_raw.get("call_to_action_type", "")
+                dest_url  = cr_raw.get("link_url", "")
 
+                oss = _safe_dict(cr_raw.get("object_story_spec"))
+                if oss:
+                    t2, b2, d2, c2 = _extract_from_oss(oss)
+                    title    = title    or t2
+                    body     = body     or b2
+                    dest_url = dest_url or d2
+                    cta      = cta      or c2
+
+                print(f"[creative] ad={ad_id} type={obj_type} title={title!r} body={body[:40]!r}")
                 creatives[ad_id] = {
-                    "ad_title":        cr.get("title", ""),
-                    "ad_body":         cr.get("body", ""),
-                    "creative_type":   object_type,
+                    "ad_title":        title,
+                    "ad_body":         body,
+                    "creative_type":   obj_type,
                     "thumbnail_url":   thumbnail,
-                    "image_url":       cr.get("image_url", "") or thumbnail,
-                    "call_to_action":  cr.get("call_to_action_type", ""),
+                    "image_url":       image_url,
+                    "call_to_action":  cta,
                     "destination_url": dest_url,
                 }
+
             except Exception as e:
                 print(f"[creative] fetch failed for ad {ad_id}: {e}")
-                creatives[ad_id] = {
-                    "ad_title": "", "ad_body": "", "creative_type": "",
-                    "thumbnail_url": "", "image_url": "",
-                    "call_to_action": "", "destination_url": "",
-                }
+                creatives[ad_id] = empty.copy()
+
         return creatives
 
     @staticmethod
