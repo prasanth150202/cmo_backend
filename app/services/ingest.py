@@ -556,6 +556,55 @@ class IngestService:
         return {"campaign_id": campaign_id, "date_from": date_from, "date_to": date_to, "rows_synced": total_rows}
 
     @staticmethod
+    def _fetch_ad_creatives(ad_ids: List[str]) -> Dict[str, Dict]:
+        """
+        Batch-fetch creative details (title, body, type, thumbnail, CTA, link) for a list of ad IDs.
+        Returns a dict keyed by ad_id.
+        """
+        from facebook_business.adobjects.ad import Ad
+        creatives: Dict[str, Dict] = {}
+        for ad_id in ad_ids:
+            try:
+                ad_obj = Ad(ad_id)
+                data = ad_obj.api_get(fields=[
+                    "name",
+                    "creative{title,body,object_type,thumbnail_url,image_url,call_to_action_type,link_url,object_story_spec}",
+                ])
+                raw = data.export_all_data() if hasattr(data, "export_all_data") else dict(data)
+                cr  = raw.get("creative") or {}
+
+                # creative_type: IMAGE, VIDEO, CAROUSEL, etc.
+                object_type = cr.get("object_type", "")
+
+                # Thumbnail: prefer thumbnail_url, fallback to image_url
+                thumbnail = cr.get("thumbnail_url", "") or cr.get("image_url", "") or ""
+
+                # Destination URL: from call_to_action or link_url
+                dest_url = cr.get("link_url", "")
+                oss = cr.get("object_story_spec") or {}
+                if not dest_url and oss:
+                    lk = oss.get("link_data") or oss.get("video_data") or {}
+                    dest_url = lk.get("link", "") or lk.get("call_to_action", {}).get("value", {}).get("link", "")
+
+                creatives[ad_id] = {
+                    "ad_title":        cr.get("title", ""),
+                    "ad_body":         cr.get("body", ""),
+                    "creative_type":   object_type,
+                    "thumbnail_url":   thumbnail,
+                    "image_url":       cr.get("image_url", "") or thumbnail,
+                    "call_to_action":  cr.get("call_to_action_type", ""),
+                    "destination_url": dest_url,
+                }
+            except Exception as e:
+                print(f"[creative] fetch failed for ad {ad_id}: {e}")
+                creatives[ad_id] = {
+                    "ad_title": "", "ad_body": "", "creative_type": "",
+                    "thumbnail_url": "", "image_url": "",
+                    "call_to_action": "", "destination_url": "",
+                }
+        return creatives
+
+    @staticmethod
     def sync_ad_daily_metrics(
         adset_id: str,
         campaign_id: str,
@@ -566,6 +615,7 @@ class IngestService:
     ) -> Dict[str, Any]:
         """
         Pull ad-level daily data from Meta for an adset and store in ad_daily_metrics.
+        Also fetches creative details (title, body, type, thumbnail, CTA) per ad.
         """
         from facebook_business.api import FacebookAdsApi
         from facebook_business.adobjects.adset import AdSet
@@ -592,7 +642,10 @@ class IngestService:
             except Exception:
                 covered = set()
 
+        # Collect all insight rows first, then batch-fetch creatives once
+        all_insight_rows: List[Dict] = []
         total_rows = 0
+
         for chunk_from, chunk_to in _date_chunks(date_from, date_to, CAMPAIGN_CHUNK_DAYS):
             if skip_existing and covered:
                 if chunk_from in {d for d, _ in covered}:
@@ -615,46 +668,8 @@ class IngestService:
                     )
                     for row in insights:
                         d = row.export_all_data()
-                        date  = d.get("date_start", "")
-                        ad_id = d.get("ad_id", "")
-                        if not date or not ad_id:
-                            continue
-                        actions     = d.get("actions")
-                        action_vals = d.get("action_values")
-                        spend       = float(d.get("spend", 0) or 0)
-                        revenue     = _extract_action(action_vals, "omni_purchase")
-                        conversions = _extract_action(actions,     "omni_purchase")
-                        atc         = _extract_action(actions,     "add_to_cart")
-                        atc_value   = _extract_action(action_vals, "add_to_cart")
-                        checkout    = _extract_action(actions,     "initiate_checkout")
-                        impressions = int(d.get("impressions", 0) or 0)
-                        clicks      = int(d.get("clicks", 0) or 0)
-                        ctr         = float(d.get("ctr", 0) or 0)
-                        roas        = round(revenue / spend, 2) if spend > 0 else 0.0
-
-                        supabase.table("ad_daily_metrics").upsert(
-                            {
-                                "date":        date,
-                                "ad_id":       ad_id,
-                                "ad_name":     d.get("ad_name", ""),
-                                "adset_id":    adset_id,
-                                "campaign_id": campaign_id,
-                                "account_id":  clean_account,
-                                "spend":       round(spend, 2),
-                                "revenue":     round(revenue, 2),
-                                "roas":        roas,
-                                "conversions": round(conversions, 1),
-                                "impressions": impressions,
-                                "clicks":      clicks,
-                                "ctr":         round(ctr, 2),
-                                "atc":         round(atc, 1),
-                                "atc_value":   round(atc_value, 2),
-                                "checkout":    round(checkout, 1),
-                                "synced_at":   datetime.utcnow().isoformat(),
-                            },
-                            on_conflict="date,ad_id",
-                        ).execute()
-                        total_rows += 1
+                        if d.get("date_start") and d.get("ad_id"):
+                            all_insight_rows.append(d)
                     break
                 except Exception as e:
                     err = str(e)
@@ -668,6 +683,62 @@ class IngestService:
                         return {"adset_id": adset_id, "rows_synced": total_rows, "error": err}
 
             time.sleep(CHUNK_DELAY)
+
+        if not all_insight_rows:
+            return {"adset_id": adset_id, "date_from": date_from, "date_to": date_to, "rows_synced": 0}
+
+        # Batch-fetch creatives for unique ad IDs
+        unique_ad_ids = list({r["ad_id"] for r in all_insight_rows})
+        creatives = IngestService._fetch_ad_creatives(unique_ad_ids)
+
+        # Upsert all rows with creative data merged in
+        for d in all_insight_rows:
+            date  = d.get("date_start", "")
+            ad_id = d.get("ad_id", "")
+            actions     = d.get("actions")
+            action_vals = d.get("action_values")
+            spend       = float(d.get("spend", 0) or 0)
+            revenue     = _extract_action(action_vals, "omni_purchase")
+            conversions = _extract_action(actions,     "omni_purchase")
+            atc         = _extract_action(actions,     "add_to_cart")
+            atc_value   = _extract_action(action_vals, "add_to_cart")
+            checkout    = _extract_action(actions,     "initiate_checkout")
+            impressions = int(d.get("impressions", 0) or 0)
+            clicks      = int(d.get("clicks", 0) or 0)
+            ctr         = float(d.get("ctr", 0) or 0)
+            roas        = round(revenue / spend, 2) if spend > 0 else 0.0
+            cr          = creatives.get(ad_id, {})
+
+            supabase.table("ad_daily_metrics").upsert(
+                {
+                    "date":            date,
+                    "ad_id":           ad_id,
+                    "ad_name":         d.get("ad_name", ""),
+                    "adset_id":        adset_id,
+                    "campaign_id":     campaign_id,
+                    "account_id":      clean_account,
+                    "spend":           round(spend, 2),
+                    "revenue":         round(revenue, 2),
+                    "roas":            roas,
+                    "conversions":     round(conversions, 1),
+                    "impressions":     impressions,
+                    "clicks":          clicks,
+                    "ctr":             round(ctr, 2),
+                    "atc":             round(atc, 1),
+                    "atc_value":       round(atc_value, 2),
+                    "checkout":        round(checkout, 1),
+                    "ad_title":        cr.get("ad_title", ""),
+                    "ad_body":         cr.get("ad_body", ""),
+                    "creative_type":   cr.get("creative_type", ""),
+                    "thumbnail_url":   cr.get("thumbnail_url", ""),
+                    "image_url":       cr.get("image_url", ""),
+                    "call_to_action":  cr.get("call_to_action", ""),
+                    "destination_url": cr.get("destination_url", ""),
+                    "synced_at":       datetime.utcnow().isoformat(),
+                },
+                on_conflict="date,ad_id",
+            ).execute()
+            total_rows += 1
 
         return {"adset_id": adset_id, "date_from": date_from, "date_to": date_to, "rows_synced": total_rows}
 

@@ -539,12 +539,16 @@ def _aggregate_adset_rows(rows: list) -> list:
 
 
 def _aggregate_ad_rows(rows: list) -> list:
-    """Aggregate ad_daily_metrics rows into per-ad totals."""
+    """Aggregate ad_daily_metrics rows into per-ad totals, preserving creative fields."""
     from collections import defaultdict
     agg: dict = defaultdict(lambda: {
         "ad_name": "", "spend": 0.0, "revenue": 0.0,
         "conversions": 0.0, "impressions": 0, "clicks": 0,
         "atc": 0.0, "checkout": 0.0, "ctr_sum": 0.0, "ctr_n": 0,
+        # Creative fields — static per ad, last value wins (they don't change)
+        "ad_title": "", "ad_body": "", "creative_type": "",
+        "thumbnail_url": "", "image_url": "",
+        "call_to_action": "", "destination_url": "",
     })
     for r in rows:
         ad_id = r["ad_id"]
@@ -560,6 +564,12 @@ def _aggregate_ad_rows(rows: list) -> list:
         if ctr > 0:
             agg[ad_id]["ctr_sum"] += ctr
             agg[ad_id]["ctr_n"]   += 1
+        # Keep latest non-empty creative values
+        for field in ("ad_title", "ad_body", "creative_type", "thumbnail_url",
+                      "image_url", "call_to_action", "destination_url"):
+            val = r.get(field, "")
+            if val:
+                agg[ad_id][field] = val
     result = []
     for ad_id, m in agg.items():
         sp   = round(m["spend"], 2)
@@ -567,19 +577,26 @@ def _aggregate_ad_rows(rows: list) -> list:
         clk  = m["clicks"]
         conv = round(m["conversions"], 1)
         result.append({
-            "ad_id":       ad_id,
-            "ad_name":     m["ad_name"],
-            "spend":       sp,
-            "revenue":     rev,
-            "roas":        round(rev / sp, 2) if sp > 0 else 0.0,
-            "conversions": conv,
-            "impressions": m["impressions"],
-            "clicks":      clk,
-            "ctr":         round(m["ctr_sum"] / m["ctr_n"], 2) if m["ctr_n"] > 0 else 0.0,
-            "atc":         int(m["atc"]),
-            "checkout":    int(m["checkout"]),
-            "cvr":         round(conv / clk * 100, 2) if clk > 0 else 0.0,
-            "cpa":         round(sp / conv, 2) if conv > 0 else None,
+            "ad_id":           ad_id,
+            "ad_name":         m["ad_name"],
+            "spend":           sp,
+            "revenue":         rev,
+            "roas":            round(rev / sp, 2) if sp > 0 else 0.0,
+            "conversions":     conv,
+            "impressions":     m["impressions"],
+            "clicks":          clk,
+            "ctr":             round(m["ctr_sum"] / m["ctr_n"], 2) if m["ctr_n"] > 0 else 0.0,
+            "atc":             int(m["atc"]),
+            "checkout":        int(m["checkout"]),
+            "cvr":             round(conv / clk * 100, 2) if clk > 0 else 0.0,
+            "cpa":             round(sp / conv, 2) if conv > 0 else None,
+            "ad_title":        m["ad_title"],
+            "ad_body":         m["ad_body"],
+            "creative_type":   m["creative_type"],
+            "thumbnail_url":   m["thumbnail_url"],
+            "image_url":       m["image_url"],
+            "call_to_action":  m["call_to_action"],
+            "destination_url": m["destination_url"],
         })
     result.sort(key=lambda x: x["spend"], reverse=True)
     return result
@@ -697,7 +714,7 @@ def get_adset_ads(
     try:
         resp = (
             supabase.table("ad_daily_metrics")
-            .select("ad_id, ad_name, spend, revenue, roas, conversions, impressions, clicks, ctr, atc, checkout")
+            .select("ad_id, ad_name, spend, revenue, roas, conversions, impressions, clicks, ctr, atc, checkout, ad_title, ad_body, creative_type, thumbnail_url, image_url, call_to_action, destination_url")
             .eq("adset_id", adset_id)
             .gte("date", date_from)
             .lte("date", date_to)
