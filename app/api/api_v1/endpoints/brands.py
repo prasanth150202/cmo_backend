@@ -491,6 +491,186 @@ def _fetch_brand_funnel(account_ids: list, date_from: str, date_to: str) -> dict
         return {}
 
 
+def _meta_adset_insights(campaign_id: str, date_from: str, date_to: str) -> list:
+    """Fetch adset-level insights from Meta API for a given campaign."""
+    try:
+        from facebook_business.api import FacebookAdsApi
+        from facebook_business.adobjects.campaign import Campaign
+        from app.core.config import settings
+        from app.services.meta import _extract_action
+
+        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+        campaign = Campaign(campaign_id)
+        insights = campaign.get_insights(
+            fields=[
+                "adset_id", "adset_name",
+                "spend", "impressions", "clicks", "ctr",
+                "actions", "action_values",
+            ],
+            params={
+                "level": "adset",
+                "time_range": {"since": date_from, "until": date_to},
+                "limit": 200,
+            },
+        )
+        from collections import defaultdict
+        agg: dict = defaultdict(lambda: {
+            "adset_name": "", "spend": 0.0, "revenue": 0.0,
+            "conversions": 0.0, "impressions": 0, "clicks": 0,
+            "atc": 0.0, "checkout": 0.0, "ctr_sum": 0.0, "ctr_n": 0,
+        })
+        for row in insights:
+            d   = row.export_all_data()
+            aid = d.get("adset_id", "")
+            if not aid:
+                continue
+            agg[aid]["adset_name"]  = d.get("adset_name", "")
+            agg[aid]["spend"]      += float(d.get("spend") or 0)
+            actions     = d.get("actions")
+            action_vals = d.get("action_values")
+            agg[aid]["revenue"]     += _extract_action(action_vals, "omni_purchase")
+            agg[aid]["conversions"] += _extract_action(actions, "omni_purchase")
+            agg[aid]["atc"]         += _extract_action(actions, "add_to_cart")
+            agg[aid]["checkout"]    += _extract_action(actions, "initiate_checkout")
+            agg[aid]["impressions"] += int(d.get("impressions") or 0)
+            agg[aid]["clicks"]      += int(d.get("clicks") or 0)
+            ctr = float(d.get("ctr") or 0)
+            if ctr > 0:
+                agg[aid]["ctr_sum"] += ctr
+                agg[aid]["ctr_n"]   += 1
+
+        result = []
+        for aid, m in agg.items():
+            sp  = round(m["spend"], 2)
+            rev = round(m["revenue"], 2)
+            clk = m["clicks"]
+            conv = round(m["conversions"], 1)
+            result.append({
+                "adset_id":   aid,
+                "adset_name": m["adset_name"],
+                "spend":      sp,
+                "revenue":    rev,
+                "roas":       round(rev / sp, 2) if sp > 0 else 0.0,
+                "conversions": conv,
+                "impressions": m["impressions"],
+                "clicks":     clk,
+                "ctr":        round(m["ctr_sum"] / m["ctr_n"], 2) if m["ctr_n"] > 0 else 0.0,
+                "atc":        int(m["atc"]),
+                "checkout":   int(m["checkout"]),
+                "cvr":        round(conv / clk * 100, 2) if clk > 0 else 0.0,
+                "cpa":        round(sp / conv, 2) if conv > 0 else None,
+            })
+        result.sort(key=lambda x: x["spend"], reverse=True)
+        return result
+    except Exception as e:
+        print(f"[adset insights] {e}")
+        return []
+
+
+def _meta_ad_insights(adset_id: str, date_from: str, date_to: str) -> list:
+    """Fetch ad-level insights from Meta API for a given adset."""
+    try:
+        from facebook_business.api import FacebookAdsApi
+        from facebook_business.adobjects.adset import AdSet
+        from app.core.config import settings
+        from app.services.meta import _extract_action
+
+        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+        adset = AdSet(adset_id)
+        insights = adset.get_insights(
+            fields=[
+                "ad_id", "ad_name",
+                "spend", "impressions", "clicks", "ctr",
+                "actions", "action_values",
+            ],
+            params={
+                "level": "ad",
+                "time_range": {"since": date_from, "until": date_to},
+                "limit": 200,
+            },
+        )
+        from collections import defaultdict
+        agg: dict = defaultdict(lambda: {
+            "ad_name": "", "spend": 0.0, "revenue": 0.0,
+            "conversions": 0.0, "impressions": 0, "clicks": 0,
+            "atc": 0.0, "checkout": 0.0, "ctr_sum": 0.0, "ctr_n": 0,
+        })
+        for row in insights:
+            d   = row.export_all_data()
+            ad_id = d.get("ad_id", "")
+            if not ad_id:
+                continue
+            agg[ad_id]["ad_name"]    = d.get("ad_name", "")
+            agg[ad_id]["spend"]     += float(d.get("spend") or 0)
+            actions     = d.get("actions")
+            action_vals = d.get("action_values")
+            agg[ad_id]["revenue"]     += _extract_action(action_vals, "omni_purchase")
+            agg[ad_id]["conversions"] += _extract_action(actions, "omni_purchase")
+            agg[ad_id]["atc"]         += _extract_action(actions, "add_to_cart")
+            agg[ad_id]["checkout"]    += _extract_action(actions, "initiate_checkout")
+            agg[ad_id]["impressions"] += int(d.get("impressions") or 0)
+            agg[ad_id]["clicks"]      += int(d.get("clicks") or 0)
+            ctr = float(d.get("ctr") or 0)
+            if ctr > 0:
+                agg[ad_id]["ctr_sum"] += ctr
+                agg[ad_id]["ctr_n"]   += 1
+
+        result = []
+        for ad_id, m in agg.items():
+            sp  = round(m["spend"], 2)
+            rev = round(m["revenue"], 2)
+            clk = m["clicks"]
+            conv = round(m["conversions"], 1)
+            result.append({
+                "ad_id":      ad_id,
+                "ad_name":    m["ad_name"],
+                "spend":      sp,
+                "revenue":    rev,
+                "roas":       round(rev / sp, 2) if sp > 0 else 0.0,
+                "conversions": conv,
+                "impressions": m["impressions"],
+                "clicks":     clk,
+                "ctr":        round(m["ctr_sum"] / m["ctr_n"], 2) if m["ctr_n"] > 0 else 0.0,
+                "atc":        int(m["atc"]),
+                "checkout":   int(m["checkout"]),
+                "cvr":        round(conv / clk * 100, 2) if clk > 0 else 0.0,
+                "cpa":        round(sp / conv, 2) if conv > 0 else None,
+            })
+        result.sort(key=lambda x: x["spend"], reverse=True)
+        return result
+    except Exception as e:
+        print(f"[ad insights] {e}")
+        return []
+
+
+@router.get("/{brand_id}/campaigns/{campaign_id}/adsets")
+def get_campaign_adsets(
+    brand_id: str,
+    campaign_id: str,
+    date_from: Optional[str] = Query(default=None),
+    date_to: Optional[str] = Query(default=None),
+) -> Any:
+    """Ad set metrics for a campaign, fetched live from Meta."""
+    from app.api.api_v1.endpoints.analytics import _default_dates
+    if not date_from or not date_to:
+        date_from, date_to = _default_dates()
+    return _meta_adset_insights(campaign_id, date_from, date_to)
+
+
+@router.get("/{brand_id}/adsets/{adset_id}/ads")
+def get_adset_ads(
+    brand_id: str,
+    adset_id: str,
+    date_from: Optional[str] = Query(default=None),
+    date_to: Optional[str] = Query(default=None),
+) -> Any:
+    """Ad-level metrics for an ad set, fetched live from Meta."""
+    from app.api.api_v1.endpoints.analytics import _default_dates
+    if not date_from or not date_to:
+        date_from, date_to = _default_dates()
+    return _meta_ad_insights(adset_id, date_from, date_to)
+
+
 @router.get("/{brand_id}/summary")
 def get_brand_summary(brand_id: str) -> Any:
     """
