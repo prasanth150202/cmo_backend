@@ -491,156 +491,98 @@ def _fetch_brand_funnel(account_ids: list, date_from: str, date_to: str) -> dict
         return {}
 
 
-def _meta_adset_insights(campaign_id: str, date_from: str, date_to: str) -> list:
-    """Fetch adset-level insights from Meta API for a given campaign."""
-    try:
-        from facebook_business.api import FacebookAdsApi
-        from facebook_business.adobjects.campaign import Campaign
-        from app.core.config import settings
-        from app.services.meta import _extract_action
-
-        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
-        campaign = Campaign(campaign_id)
-        insights = campaign.get_insights(
-            fields=[
-                "adset_id", "adset_name",
-                "spend", "impressions", "clicks", "ctr",
-                "actions", "action_values",
-            ],
-            params={
-                "level": "adset",
-                "time_range": {"since": date_from, "until": date_to},
-                "limit": 200,
-            },
-        )
-        from collections import defaultdict
-        agg: dict = defaultdict(lambda: {
-            "adset_name": "", "spend": 0.0, "revenue": 0.0,
-            "conversions": 0.0, "impressions": 0, "clicks": 0,
-            "atc": 0.0, "checkout": 0.0, "ctr_sum": 0.0, "ctr_n": 0,
+def _aggregate_adset_rows(rows: list) -> list:
+    """Aggregate adset_daily_metrics rows (multiple dates) into per-adset totals."""
+    from collections import defaultdict
+    agg: dict = defaultdict(lambda: {
+        "adset_name": "", "spend": 0.0, "revenue": 0.0,
+        "conversions": 0.0, "impressions": 0, "clicks": 0,
+        "atc": 0.0, "checkout": 0.0, "ctr_sum": 0.0, "ctr_n": 0,
+    })
+    for r in rows:
+        aid = r["adset_id"]
+        agg[aid]["adset_name"]  = r.get("adset_name") or aid
+        agg[aid]["spend"]      += float(r.get("spend") or 0)
+        agg[aid]["revenue"]    += float(r.get("revenue") or 0)
+        agg[aid]["conversions"]+= float(r.get("conversions") or 0)
+        agg[aid]["impressions"]+= int(r.get("impressions") or 0)
+        agg[aid]["clicks"]     += int(r.get("clicks") or 0)
+        agg[aid]["atc"]        += float(r.get("atc") or 0)
+        agg[aid]["checkout"]   += float(r.get("checkout") or 0)
+        ctr = float(r.get("ctr") or 0)
+        if ctr > 0:
+            agg[aid]["ctr_sum"] += ctr
+            agg[aid]["ctr_n"]   += 1
+    result = []
+    for aid, m in agg.items():
+        sp   = round(m["spend"], 2)
+        rev  = round(m["revenue"], 2)
+        clk  = m["clicks"]
+        conv = round(m["conversions"], 1)
+        result.append({
+            "adset_id":    aid,
+            "adset_name":  m["adset_name"],
+            "spend":       sp,
+            "revenue":     rev,
+            "roas":        round(rev / sp, 2) if sp > 0 else 0.0,
+            "conversions": conv,
+            "impressions": m["impressions"],
+            "clicks":      clk,
+            "ctr":         round(m["ctr_sum"] / m["ctr_n"], 2) if m["ctr_n"] > 0 else 0.0,
+            "atc":         int(m["atc"]),
+            "checkout":    int(m["checkout"]),
+            "cvr":         round(conv / clk * 100, 2) if clk > 0 else 0.0,
+            "cpa":         round(sp / conv, 2) if conv > 0 else None,
         })
-        for row in insights:
-            d   = row.export_all_data()
-            aid = d.get("adset_id", "")
-            if not aid:
-                continue
-            agg[aid]["adset_name"]  = d.get("adset_name", "")
-            agg[aid]["spend"]      += float(d.get("spend") or 0)
-            actions     = d.get("actions")
-            action_vals = d.get("action_values")
-            agg[aid]["revenue"]     += _extract_action(action_vals, "omni_purchase")
-            agg[aid]["conversions"] += _extract_action(actions, "omni_purchase")
-            agg[aid]["atc"]         += _extract_action(actions, "add_to_cart")
-            agg[aid]["checkout"]    += _extract_action(actions, "initiate_checkout")
-            agg[aid]["impressions"] += int(d.get("impressions") or 0)
-            agg[aid]["clicks"]      += int(d.get("clicks") or 0)
-            ctr = float(d.get("ctr") or 0)
-            if ctr > 0:
-                agg[aid]["ctr_sum"] += ctr
-                agg[aid]["ctr_n"]   += 1
-
-        result = []
-        for aid, m in agg.items():
-            sp  = round(m["spend"], 2)
-            rev = round(m["revenue"], 2)
-            clk = m["clicks"]
-            conv = round(m["conversions"], 1)
-            result.append({
-                "adset_id":   aid,
-                "adset_name": m["adset_name"],
-                "spend":      sp,
-                "revenue":    rev,
-                "roas":       round(rev / sp, 2) if sp > 0 else 0.0,
-                "conversions": conv,
-                "impressions": m["impressions"],
-                "clicks":     clk,
-                "ctr":        round(m["ctr_sum"] / m["ctr_n"], 2) if m["ctr_n"] > 0 else 0.0,
-                "atc":        int(m["atc"]),
-                "checkout":   int(m["checkout"]),
-                "cvr":        round(conv / clk * 100, 2) if clk > 0 else 0.0,
-                "cpa":        round(sp / conv, 2) if conv > 0 else None,
-            })
-        result.sort(key=lambda x: x["spend"], reverse=True)
-        return result
-    except Exception as e:
-        print(f"[adset insights] {e}")
-        return []
+    result.sort(key=lambda x: x["spend"], reverse=True)
+    return result
 
 
-def _meta_ad_insights(adset_id: str, date_from: str, date_to: str) -> list:
-    """Fetch ad-level insights from Meta API for a given adset."""
-    try:
-        from facebook_business.api import FacebookAdsApi
-        from facebook_business.adobjects.adset import AdSet
-        from app.core.config import settings
-        from app.services.meta import _extract_action
-
-        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
-        adset = AdSet(adset_id)
-        insights = adset.get_insights(
-            fields=[
-                "ad_id", "ad_name",
-                "spend", "impressions", "clicks", "ctr",
-                "actions", "action_values",
-            ],
-            params={
-                "level": "ad",
-                "time_range": {"since": date_from, "until": date_to},
-                "limit": 200,
-            },
-        )
-        from collections import defaultdict
-        agg: dict = defaultdict(lambda: {
-            "ad_name": "", "spend": 0.0, "revenue": 0.0,
-            "conversions": 0.0, "impressions": 0, "clicks": 0,
-            "atc": 0.0, "checkout": 0.0, "ctr_sum": 0.0, "ctr_n": 0,
+def _aggregate_ad_rows(rows: list) -> list:
+    """Aggregate ad_daily_metrics rows into per-ad totals."""
+    from collections import defaultdict
+    agg: dict = defaultdict(lambda: {
+        "ad_name": "", "spend": 0.0, "revenue": 0.0,
+        "conversions": 0.0, "impressions": 0, "clicks": 0,
+        "atc": 0.0, "checkout": 0.0, "ctr_sum": 0.0, "ctr_n": 0,
+    })
+    for r in rows:
+        ad_id = r["ad_id"]
+        agg[ad_id]["ad_name"]     = r.get("ad_name") or ad_id
+        agg[ad_id]["spend"]      += float(r.get("spend") or 0)
+        agg[ad_id]["revenue"]    += float(r.get("revenue") or 0)
+        agg[ad_id]["conversions"]+= float(r.get("conversions") or 0)
+        agg[ad_id]["impressions"]+= int(r.get("impressions") or 0)
+        agg[ad_id]["clicks"]     += int(r.get("clicks") or 0)
+        agg[ad_id]["atc"]        += float(r.get("atc") or 0)
+        agg[ad_id]["checkout"]   += float(r.get("checkout") or 0)
+        ctr = float(r.get("ctr") or 0)
+        if ctr > 0:
+            agg[ad_id]["ctr_sum"] += ctr
+            agg[ad_id]["ctr_n"]   += 1
+    result = []
+    for ad_id, m in agg.items():
+        sp   = round(m["spend"], 2)
+        rev  = round(m["revenue"], 2)
+        clk  = m["clicks"]
+        conv = round(m["conversions"], 1)
+        result.append({
+            "ad_id":       ad_id,
+            "ad_name":     m["ad_name"],
+            "spend":       sp,
+            "revenue":     rev,
+            "roas":        round(rev / sp, 2) if sp > 0 else 0.0,
+            "conversions": conv,
+            "impressions": m["impressions"],
+            "clicks":      clk,
+            "ctr":         round(m["ctr_sum"] / m["ctr_n"], 2) if m["ctr_n"] > 0 else 0.0,
+            "atc":         int(m["atc"]),
+            "checkout":    int(m["checkout"]),
+            "cvr":         round(conv / clk * 100, 2) if clk > 0 else 0.0,
+            "cpa":         round(sp / conv, 2) if conv > 0 else None,
         })
-        for row in insights:
-            d   = row.export_all_data()
-            ad_id = d.get("ad_id", "")
-            if not ad_id:
-                continue
-            agg[ad_id]["ad_name"]    = d.get("ad_name", "")
-            agg[ad_id]["spend"]     += float(d.get("spend") or 0)
-            actions     = d.get("actions")
-            action_vals = d.get("action_values")
-            agg[ad_id]["revenue"]     += _extract_action(action_vals, "omni_purchase")
-            agg[ad_id]["conversions"] += _extract_action(actions, "omni_purchase")
-            agg[ad_id]["atc"]         += _extract_action(actions, "add_to_cart")
-            agg[ad_id]["checkout"]    += _extract_action(actions, "initiate_checkout")
-            agg[ad_id]["impressions"] += int(d.get("impressions") or 0)
-            agg[ad_id]["clicks"]      += int(d.get("clicks") or 0)
-            ctr = float(d.get("ctr") or 0)
-            if ctr > 0:
-                agg[ad_id]["ctr_sum"] += ctr
-                agg[ad_id]["ctr_n"]   += 1
-
-        result = []
-        for ad_id, m in agg.items():
-            sp  = round(m["spend"], 2)
-            rev = round(m["revenue"], 2)
-            clk = m["clicks"]
-            conv = round(m["conversions"], 1)
-            result.append({
-                "ad_id":      ad_id,
-                "ad_name":    m["ad_name"],
-                "spend":      sp,
-                "revenue":    rev,
-                "roas":       round(rev / sp, 2) if sp > 0 else 0.0,
-                "conversions": conv,
-                "impressions": m["impressions"],
-                "clicks":     clk,
-                "ctr":        round(m["ctr_sum"] / m["ctr_n"], 2) if m["ctr_n"] > 0 else 0.0,
-                "atc":        int(m["atc"]),
-                "checkout":   int(m["checkout"]),
-                "cvr":        round(conv / clk * 100, 2) if clk > 0 else 0.0,
-                "cpa":        round(sp / conv, 2) if conv > 0 else None,
-            })
-        result.sort(key=lambda x: x["spend"], reverse=True)
-        return result
-    except Exception as e:
-        print(f"[ad insights] {e}")
-        return []
+    result.sort(key=lambda x: x["spend"], reverse=True)
+    return result
 
 
 @router.get("/{brand_id}/campaigns/{campaign_id}/adsets")
@@ -649,12 +591,89 @@ def get_campaign_adsets(
     campaign_id: str,
     date_from: Optional[str] = Query(default=None),
     date_to: Optional[str] = Query(default=None),
+    background_tasks: BackgroundTasks = None,
 ) -> Any:
-    """Ad set metrics for a campaign, fetched live from Meta."""
+    """
+    Ad set metrics for a campaign.
+    Reads from adset_daily_metrics (Supabase). If no data exists for the range,
+    triggers a background sync from Meta and returns empty (client should retry).
+    """
     from app.api.api_v1.endpoints.analytics import _default_dates
     if not date_from or not date_to:
         date_from, date_to = _default_dates()
-    return _meta_adset_insights(campaign_id, date_from, date_to)
+
+    # 1. Read from DB
+    try:
+        resp = (
+            supabase.table("adset_daily_metrics")
+            .select("adset_id, adset_name, spend, revenue, roas, conversions, impressions, clicks, ctr, atc, checkout")
+            .eq("campaign_id", campaign_id)
+            .gte("date", date_from)
+            .lte("date", date_to)
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception:
+        rows = []
+
+    if rows:
+        return _aggregate_adset_rows(rows)
+
+    # 2. No DB data — find account_id for this campaign then trigger background sync
+    try:
+        camp_resp = (
+            supabase.table("campaign_daily_metrics")
+            .select("account_id")
+            .eq("campaign_id", campaign_id)
+            .limit(1)
+            .execute()
+        )
+        account_id = camp_resp.data[0]["account_id"] if camp_resp.data else ""
+    except Exception:
+        account_id = ""
+
+    if account_id and background_tasks is not None:
+        from app.services.ingest import IngestService
+        background_tasks.add_task(
+            IngestService.sync_adset_daily_metrics,
+            campaign_id, account_id, date_from, date_to,
+        )
+
+    return []
+
+
+@router.post("/{brand_id}/campaigns/{campaign_id}/adsets/sync")
+def sync_campaign_adsets(
+    brand_id: str,
+    campaign_id: str,
+    date_from: Optional[str] = Query(default=None),
+    date_to: Optional[str] = Query(default=None),
+    background_tasks: BackgroundTasks = None,
+) -> Any:
+    """Trigger a background sync of ad set metrics for a campaign into Supabase."""
+    from app.api.api_v1.endpoints.analytics import _default_dates
+    from app.services.ingest import IngestService
+    if not date_from or not date_to:
+        date_from, date_to = _default_dates()
+    try:
+        camp_resp = (
+            supabase.table("campaign_daily_metrics")
+            .select("account_id")
+            .eq("campaign_id", campaign_id)
+            .limit(1)
+            .execute()
+        )
+        account_id = camp_resp.data[0]["account_id"] if camp_resp.data else ""
+    except Exception:
+        account_id = ""
+    if not account_id:
+        raise HTTPException(status_code=404, detail="Campaign not found in DB")
+    if background_tasks is not None:
+        background_tasks.add_task(
+            IngestService.sync_adset_daily_metrics,
+            campaign_id, account_id, date_from, date_to, False,
+        )
+    return {"status": "sync_started", "campaign_id": campaign_id, "date_from": date_from, "date_to": date_to}
 
 
 @router.get("/{brand_id}/adsets/{adset_id}/ads")
@@ -663,12 +682,95 @@ def get_adset_ads(
     adset_id: str,
     date_from: Optional[str] = Query(default=None),
     date_to: Optional[str] = Query(default=None),
+    background_tasks: BackgroundTasks = None,
 ) -> Any:
-    """Ad-level metrics for an ad set, fetched live from Meta."""
+    """
+    Ad-level metrics for an ad set.
+    Reads from ad_daily_metrics (Supabase). If no data exists for the range,
+    triggers a background sync from Meta and returns empty (client should retry).
+    """
     from app.api.api_v1.endpoints.analytics import _default_dates
     if not date_from or not date_to:
         date_from, date_to = _default_dates()
-    return _meta_ad_insights(adset_id, date_from, date_to)
+
+    # 1. Read from DB
+    try:
+        resp = (
+            supabase.table("ad_daily_metrics")
+            .select("ad_id, ad_name, spend, revenue, roas, conversions, impressions, clicks, ctr, atc, checkout")
+            .eq("adset_id", adset_id)
+            .gte("date", date_from)
+            .lte("date", date_to)
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception:
+        rows = []
+
+    if rows:
+        return _aggregate_ad_rows(rows)
+
+    # 2. No DB data — find campaign_id + account_id then trigger background sync
+    try:
+        adset_resp = (
+            supabase.table("adset_daily_metrics")
+            .select("campaign_id, account_id")
+            .eq("adset_id", adset_id)
+            .limit(1)
+            .execute()
+        )
+        parent = adset_resp.data[0] if adset_resp.data else {}
+        campaign_id = parent.get("campaign_id", "")
+        account_id  = parent.get("account_id", "")
+    except Exception:
+        campaign_id = ""
+        account_id  = ""
+
+    if account_id and background_tasks is not None:
+        from app.services.ingest import IngestService
+        background_tasks.add_task(
+            IngestService.sync_ad_daily_metrics,
+            adset_id, campaign_id, account_id, date_from, date_to,
+        )
+
+    return []
+
+
+@router.post("/{brand_id}/adsets/{adset_id}/ads/sync")
+def sync_adset_ads(
+    brand_id: str,
+    adset_id: str,
+    date_from: Optional[str] = Query(default=None),
+    date_to: Optional[str] = Query(default=None),
+    background_tasks: BackgroundTasks = None,
+) -> Any:
+    """Trigger a background sync of ad metrics for an ad set into Supabase."""
+    from app.api.api_v1.endpoints.analytics import _default_dates
+    from app.services.ingest import IngestService
+    if not date_from or not date_to:
+        date_from, date_to = _default_dates()
+    try:
+        adset_resp = (
+            supabase.table("adset_daily_metrics")
+            .select("campaign_id, account_id")
+            .eq("adset_id", adset_id)
+            .limit(1)
+            .execute()
+        )
+        parent = adset_resp.data[0] if adset_resp.data else {}
+        campaign_id = parent.get("campaign_id", "")
+        account_id  = parent.get("account_id", "")
+    except Exception:
+        campaign_id = ""
+        account_id  = ""
+    if not account_id:
+        raise HTTPException(status_code=404, detail="Ad set not found in DB")
+    if background_tasks is not None:
+        background_tasks.add_task(
+            IngestService.sync_ad_daily_metrics,
+            adset_id, campaign_id, account_id, date_from, date_to, False,
+        )
+    return {"status": "sync_started", "adset_id": adset_id, "date_from": date_from, "date_to": date_to}
 
 
 @router.get("/{brand_id}/summary")

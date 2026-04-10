@@ -439,6 +439,238 @@ class IngestService:
             "details": results,
         }
 
+    @staticmethod
+    def sync_adset_daily_metrics(
+        campaign_id: str,
+        account_id: str,
+        date_from: str,
+        date_to: str,
+        skip_existing: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Pull adset-level daily data from Meta for a campaign and store in adset_daily_metrics.
+        Uses 30-day chunks, level=adset, time_increment=1.
+        """
+        from facebook_business.api import FacebookAdsApi
+        from facebook_business.adobjects.campaign import Campaign
+        from app.core.config import settings
+
+        if not settings.META_SYSTEM_USER_TOKEN:
+            return {"error": "META_SYSTEM_USER_TOKEN not configured", "rows_synced": 0}
+
+        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+        clean_account = account_id.replace("act_", "")
+
+        # Check what's already stored
+        covered: set = set()
+        if skip_existing:
+            try:
+                resp = (
+                    supabase.table("adset_daily_metrics")
+                    .select("date, adset_id")
+                    .eq("campaign_id", campaign_id)
+                    .gte("date", date_from)
+                    .lte("date", date_to)
+                    .execute()
+                )
+                covered = {(str(r["date"])[:10], r["adset_id"]) for r in (resp.data or [])}
+            except Exception:
+                covered = set()
+
+        total_rows = 0
+        for chunk_from, chunk_to in _date_chunks(date_from, date_to, CAMPAIGN_CHUNK_DAYS):
+            if skip_existing and covered:
+                if chunk_from in {d for d, _ in covered}:
+                    continue
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    insights = Campaign(campaign_id).get_insights(
+                        fields=[
+                            "adset_id", "adset_name",
+                            "spend", "impressions", "clicks", "ctr",
+                            "actions", "action_values",
+                        ],
+                        params={
+                            "level": "adset",
+                            "time_range": {"since": chunk_from, "until": chunk_to},
+                            "time_increment": 1,
+                            "limit": 500,
+                        },
+                    )
+                    for row in insights:
+                        d = row.export_all_data()
+                        date    = d.get("date_start", "")
+                        adset_id = d.get("adset_id", "")
+                        if not date or not adset_id:
+                            continue
+                        actions     = d.get("actions")
+                        action_vals = d.get("action_values")
+                        spend       = float(d.get("spend", 0) or 0)
+                        revenue     = _extract_action(action_vals, "omni_purchase")
+                        conversions = _extract_action(actions,     "omni_purchase")
+                        atc         = _extract_action(actions,     "add_to_cart")
+                        atc_value   = _extract_action(action_vals, "add_to_cart")
+                        checkout    = _extract_action(actions,     "initiate_checkout")
+                        impressions = int(d.get("impressions", 0) or 0)
+                        clicks      = int(d.get("clicks", 0) or 0)
+                        ctr         = float(d.get("ctr", 0) or 0)
+                        roas        = round(revenue / spend, 2) if spend > 0 else 0.0
+
+                        supabase.table("adset_daily_metrics").upsert(
+                            {
+                                "date":         date,
+                                "adset_id":     adset_id,
+                                "adset_name":   d.get("adset_name", ""),
+                                "campaign_id":  campaign_id,
+                                "account_id":   clean_account,
+                                "spend":        round(spend, 2),
+                                "revenue":      round(revenue, 2),
+                                "roas":         roas,
+                                "conversions":  round(conversions, 1),
+                                "impressions":  impressions,
+                                "clicks":       clicks,
+                                "ctr":          round(ctr, 2),
+                                "atc":          round(atc, 1),
+                                "atc_value":    round(atc_value, 2),
+                                "checkout":     round(checkout, 1),
+                                "synced_at":    datetime.utcnow().isoformat(),
+                            },
+                            on_conflict="date,adset_id",
+                        ).execute()
+                        total_rows += 1
+                    break
+                except Exception as e:
+                    err = str(e)
+                    is_rate_limit = "rate" in err.lower() or "429" in err or "throttle" in err.lower()
+                    wait = (2 ** attempt) * 5 if is_rate_limit else 2
+                    print(f"[adset] chunk error (attempt {attempt}/{MAX_RETRIES}) "
+                          f"{campaign_id} {chunk_from}→{chunk_to}: {err}")
+                    if attempt < MAX_RETRIES:
+                        time.sleep(wait)
+                    else:
+                        return {"campaign_id": campaign_id, "rows_synced": total_rows, "error": err}
+
+            time.sleep(CHUNK_DELAY)
+
+        return {"campaign_id": campaign_id, "date_from": date_from, "date_to": date_to, "rows_synced": total_rows}
+
+    @staticmethod
+    def sync_ad_daily_metrics(
+        adset_id: str,
+        campaign_id: str,
+        account_id: str,
+        date_from: str,
+        date_to: str,
+        skip_existing: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Pull ad-level daily data from Meta for an adset and store in ad_daily_metrics.
+        """
+        from facebook_business.api import FacebookAdsApi
+        from facebook_business.adobjects.adset import AdSet
+        from app.core.config import settings
+
+        if not settings.META_SYSTEM_USER_TOKEN:
+            return {"error": "META_SYSTEM_USER_TOKEN not configured", "rows_synced": 0}
+
+        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+        clean_account = account_id.replace("act_", "")
+
+        covered: set = set()
+        if skip_existing:
+            try:
+                resp = (
+                    supabase.table("ad_daily_metrics")
+                    .select("date, ad_id")
+                    .eq("adset_id", adset_id)
+                    .gte("date", date_from)
+                    .lte("date", date_to)
+                    .execute()
+                )
+                covered = {(str(r["date"])[:10], r["ad_id"]) for r in (resp.data or [])}
+            except Exception:
+                covered = set()
+
+        total_rows = 0
+        for chunk_from, chunk_to in _date_chunks(date_from, date_to, CAMPAIGN_CHUNK_DAYS):
+            if skip_existing and covered:
+                if chunk_from in {d for d, _ in covered}:
+                    continue
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    insights = AdSet(adset_id).get_insights(
+                        fields=[
+                            "ad_id", "ad_name",
+                            "spend", "impressions", "clicks", "ctr",
+                            "actions", "action_values",
+                        ],
+                        params={
+                            "level": "ad",
+                            "time_range": {"since": chunk_from, "until": chunk_to},
+                            "time_increment": 1,
+                            "limit": 500,
+                        },
+                    )
+                    for row in insights:
+                        d = row.export_all_data()
+                        date  = d.get("date_start", "")
+                        ad_id = d.get("ad_id", "")
+                        if not date or not ad_id:
+                            continue
+                        actions     = d.get("actions")
+                        action_vals = d.get("action_values")
+                        spend       = float(d.get("spend", 0) or 0)
+                        revenue     = _extract_action(action_vals, "omni_purchase")
+                        conversions = _extract_action(actions,     "omni_purchase")
+                        atc         = _extract_action(actions,     "add_to_cart")
+                        atc_value   = _extract_action(action_vals, "add_to_cart")
+                        checkout    = _extract_action(actions,     "initiate_checkout")
+                        impressions = int(d.get("impressions", 0) or 0)
+                        clicks      = int(d.get("clicks", 0) or 0)
+                        ctr         = float(d.get("ctr", 0) or 0)
+                        roas        = round(revenue / spend, 2) if spend > 0 else 0.0
+
+                        supabase.table("ad_daily_metrics").upsert(
+                            {
+                                "date":        date,
+                                "ad_id":       ad_id,
+                                "ad_name":     d.get("ad_name", ""),
+                                "adset_id":    adset_id,
+                                "campaign_id": campaign_id,
+                                "account_id":  clean_account,
+                                "spend":       round(spend, 2),
+                                "revenue":     round(revenue, 2),
+                                "roas":        roas,
+                                "conversions": round(conversions, 1),
+                                "impressions": impressions,
+                                "clicks":      clicks,
+                                "ctr":         round(ctr, 2),
+                                "atc":         round(atc, 1),
+                                "atc_value":   round(atc_value, 2),
+                                "checkout":    round(checkout, 1),
+                                "synced_at":   datetime.utcnow().isoformat(),
+                            },
+                            on_conflict="date,ad_id",
+                        ).execute()
+                        total_rows += 1
+                    break
+                except Exception as e:
+                    err = str(e)
+                    is_rate_limit = "rate" in err.lower() or "429" in err or "throttle" in err.lower()
+                    wait = (2 ** attempt) * 5 if is_rate_limit else 2
+                    print(f"[ad] chunk error (attempt {attempt}/{MAX_RETRIES}) "
+                          f"{adset_id} {chunk_from}→{chunk_to}: {err}")
+                    if attempt < MAX_RETRIES:
+                        time.sleep(wait)
+                    else:
+                        return {"adset_id": adset_id, "rows_synced": total_rows, "error": err}
+
+            time.sleep(CHUNK_DELAY)
+
+        return {"adset_id": adset_id, "date_from": date_from, "date_to": date_to, "rows_synced": total_rows}
+
 
 # Global instance
 ingest_service = IngestService()
