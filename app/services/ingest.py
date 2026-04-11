@@ -556,26 +556,15 @@ class IngestService:
         return {"campaign_id": campaign_id, "date_from": date_from, "date_to": date_to, "rows_synced": total_rows}
 
     @staticmethod
-    def _fetch_ad_creatives(ad_ids: List[str]) -> Dict[str, Dict]:
+    def _fetch_ads_metadata(adset_id: str) -> Dict[str, Dict]:
         """
-        Fetch creative details for a list of ad IDs.
-        Strategy:
-          1. Fetch each Ad to get its creative_id.
-          2. Fetch the AdCreative directly with all fields.
-          3. Extract title/body from top-level OR object_story_spec (link/video/carousel).
+        Fetch creative details + effective_status for ALL ads in an adset
+        via a single AdSet.get_ads() API call (replaces the old N*2 per-ad loop).
+        Returns dict keyed by ad_id.
         """
-        from facebook_business.adobjects.ad import Ad
-        from facebook_business.adobjects.adcreative import AdCreative
-
-        CREATIVE_FIELDS = [
-            "title", "body", "object_type",
-            "thumbnail_url", "image_url",
-            "call_to_action_type", "link_url",
-            "object_story_spec",
-        ]
+        from facebook_business.adobjects.adset import AdSet
 
         def _safe_dict(obj) -> dict:
-            """Export SDK object or return as-is if already a dict."""
             if obj is None:
                 return {}
             if hasattr(obj, "export_all_data"):
@@ -585,10 +574,7 @@ class IngestService:
             return {}
 
         def _extract_from_oss(oss: dict) -> tuple:
-            """Pull title, body, dest_url, cta from object_story_spec."""
             title, body, dest_url, cta = "", "", "", ""
-
-            # Link ad
             ld = _safe_dict(oss.get("link_data"))
             if ld:
                 title    = title    or ld.get("name", "")
@@ -598,8 +584,6 @@ class IngestService:
                 cta      = cta      or cta_obj.get("type", "")
                 if not dest_url:
                     dest_url = _safe_dict(cta_obj.get("value")).get("link", "")
-
-            # Video ad
             vd = _safe_dict(oss.get("video_data"))
             if vd:
                 title    = title    or vd.get("title", "")
@@ -608,60 +592,43 @@ class IngestService:
                 cta      = cta      or cta_obj.get("type", "")
                 if not dest_url:
                     dest_url = _safe_dict(cta_obj.get("value")).get("link", "")
-
-            # Carousel (multi_share_data)
             md = _safe_dict(oss.get("template_data") or oss.get("multi_share_data"))
             if md:
                 body     = body     or md.get("message", "")
                 dest_url = dest_url or md.get("link", "")
-
             return title, body, dest_url, cta
 
-        creatives: Dict[str, Dict] = {}
-        empty = {
-            "ad_title": "", "ad_body": "", "creative_type": "",
-            "thumbnail_url": "", "image_url": "",
-            "call_to_action": "", "destination_url": "",
-        }
-
-        for ad_id in ad_ids:
-            try:
-                # Step 1: get creative ID from the Ad object
-                ad_obj  = Ad(ad_id)
-                ad_data = _safe_dict(ad_obj.api_get(fields=["creative"]))
-                cr_ref  = ad_data.get("creative") or {}
-                if hasattr(cr_ref, "export_all_data"):
-                    cr_ref = cr_ref.export_all_data() or {}
-                creative_id = cr_ref.get("id", "") if isinstance(cr_ref, dict) else ""
-
-                if not creative_id:
-                    print(f"[creative] no creative_id for ad {ad_id}")
-                    creatives[ad_id] = empty.copy()
+        try:
+            ads = AdSet(adset_id).get_ads(
+                fields=[
+                    "id", "name", "effective_status",
+                    "creative{title,body,object_type,thumbnail_url,image_url,"
+                    "call_to_action_type,link_url,object_story_spec}",
+                ],
+                params={"limit": 500},
+            )
+            result: Dict[str, Dict] = {}
+            for ad in ads:
+                d     = _safe_dict(ad)
+                ad_id = d.get("id", "")
+                if not ad_id:
                     continue
-
-                # Step 2: fetch AdCreative directly
-                cr_obj  = AdCreative(creative_id)
-                cr_raw  = _safe_dict(cr_obj.api_get(fields=CREATIVE_FIELDS))
-
-                # Step 3: extract fields — top-level first, then object_story_spec
-                title    = cr_raw.get("title", "")
-                body     = cr_raw.get("body", "")
-                obj_type = cr_raw.get("object_type", "")
-                thumbnail = cr_raw.get("thumbnail_url", "") or cr_raw.get("image_url", "")
-                image_url = cr_raw.get("image_url", "") or thumbnail
-                cta       = cr_raw.get("call_to_action_type", "")
-                dest_url  = cr_raw.get("link_url", "")
-
-                oss = _safe_dict(cr_raw.get("object_story_spec"))
+                cr        = _safe_dict(d.get("creative"))
+                title     = cr.get("title", "")
+                body      = cr.get("body", "")
+                obj_type  = cr.get("object_type", "")
+                thumbnail = cr.get("thumbnail_url", "") or cr.get("image_url", "")
+                image_url = cr.get("image_url", "") or thumbnail
+                cta       = cr.get("call_to_action_type", "")
+                dest_url  = cr.get("link_url", "")
+                oss = _safe_dict(cr.get("object_story_spec"))
                 if oss:
                     t2, b2, d2, c2 = _extract_from_oss(oss)
                     title    = title    or t2
                     body     = body     or b2
                     dest_url = dest_url or d2
                     cta      = cta      or c2
-
-                print(f"[creative] ad={ad_id} type={obj_type} title={title!r} body={body[:40]!r}")
-                creatives[ad_id] = {
+                result[ad_id] = {
                     "ad_title":        title,
                     "ad_body":         body,
                     "creative_type":   obj_type,
@@ -669,13 +636,13 @@ class IngestService:
                     "image_url":       image_url,
                     "call_to_action":  cta,
                     "destination_url": dest_url,
+                    "ad_status":       d.get("effective_status", "UNKNOWN"),
                 }
-
-            except Exception as e:
-                print(f"[creative] fetch failed for ad {ad_id}: {e}")
-                creatives[ad_id] = empty.copy()
-
-        return creatives
+            print(f"[creative] batch fetched {len(result)} ads for adset {adset_id}")
+            return result
+        except Exception as e:
+            print(f"[creative] batch fetch failed for adset {adset_id}: {e}")
+            return {}
 
     @staticmethod
     def sync_ad_daily_metrics(
@@ -760,11 +727,10 @@ class IngestService:
         if not all_insight_rows:
             return {"adset_id": adset_id, "date_from": date_from, "date_to": date_to, "rows_synced": 0}
 
-        # Batch-fetch creatives for unique ad IDs
-        unique_ad_ids = list({r["ad_id"] for r in all_insight_rows})
-        creatives = IngestService._fetch_ad_creatives(unique_ad_ids)
+        # Batch-fetch creatives + status for all ads in one API call
+        ads_meta = IngestService._fetch_ads_metadata(adset_id)
 
-        # Upsert all rows with creative data merged in
+        # Upsert all rows with creative + status data merged in
         for d in all_insight_rows:
             date  = d.get("date_start", "")
             ad_id = d.get("ad_id", "")
@@ -780,7 +746,7 @@ class IngestService:
             clicks      = int(d.get("clicks", 0) or 0)
             ctr         = float(d.get("ctr", 0) or 0)
             roas        = round(revenue / spend, 2) if spend > 0 else 0.0
-            cr          = creatives.get(ad_id, {})
+            meta        = ads_meta.get(ad_id, {})
 
             supabase.table("ad_daily_metrics").upsert(
                 {
@@ -800,13 +766,14 @@ class IngestService:
                     "atc":             round(atc, 1),
                     "atc_value":       round(atc_value, 2),
                     "checkout":        round(checkout, 1),
-                    "ad_title":        cr.get("ad_title", ""),
-                    "ad_body":         cr.get("ad_body", ""),
-                    "creative_type":   cr.get("creative_type", ""),
-                    "thumbnail_url":   cr.get("thumbnail_url", ""),
-                    "image_url":       cr.get("image_url", ""),
-                    "call_to_action":  cr.get("call_to_action", ""),
-                    "destination_url": cr.get("destination_url", ""),
+                    "ad_title":        meta.get("ad_title", ""),
+                    "ad_body":         meta.get("ad_body", ""),
+                    "creative_type":   meta.get("creative_type", ""),
+                    "thumbnail_url":   meta.get("thumbnail_url", ""),
+                    "image_url":       meta.get("image_url", ""),
+                    "call_to_action":  meta.get("call_to_action", ""),
+                    "destination_url": meta.get("destination_url", ""),
+                    "ad_status":       meta.get("ad_status", "UNKNOWN"),
                     "synced_at":       datetime.utcnow().isoformat(),
                 },
                 on_conflict="date,ad_id",
@@ -814,6 +781,45 @@ class IngestService:
             total_rows += 1
 
         return {"adset_id": adset_id, "date_from": date_from, "date_to": date_to, "rows_synced": total_rows}
+
+    @staticmethod
+    def backfill_ad_creatives(adset_id: str) -> Dict[str, Any]:
+        """
+        Fast creative backfill: fetch metadata for all ads in the adset via a single
+        API call and update creative/status fields in ad_daily_metrics without
+        re-pulling performance data from Meta.
+        """
+        from app.core.config import settings
+        from facebook_business.api import FacebookAdsApi
+
+        if not settings.META_SYSTEM_USER_TOKEN:
+            return {"error": "META_SYSTEM_USER_TOKEN not configured", "updated": 0}
+
+        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+        ads_meta = IngestService._fetch_ads_metadata(adset_id)
+
+        if not ads_meta:
+            return {"adset_id": adset_id, "updated": 0, "error": "no metadata returned"}
+
+        updated = 0
+        for ad_id, meta in ads_meta.items():
+            try:
+                supabase.table("ad_daily_metrics").update({
+                    "ad_title":        meta.get("ad_title", ""),
+                    "ad_body":         meta.get("ad_body", ""),
+                    "creative_type":   meta.get("creative_type", ""),
+                    "thumbnail_url":   meta.get("thumbnail_url", ""),
+                    "image_url":       meta.get("image_url", ""),
+                    "call_to_action":  meta.get("call_to_action", ""),
+                    "destination_url": meta.get("destination_url", ""),
+                    "ad_status":       meta.get("ad_status", "UNKNOWN"),
+                    "synced_at":       datetime.utcnow().isoformat(),
+                }).eq("ad_id", ad_id).execute()
+                updated += 1
+            except Exception as e:
+                print(f"[backfill] update error for ad {ad_id}: {e}")
+
+        return {"adset_id": adset_id, "updated": updated}
 
 
 # Global instance

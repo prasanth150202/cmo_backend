@@ -545,10 +545,12 @@ def _aggregate_ad_rows(rows: list) -> list:
         "ad_name": "", "spend": 0.0, "revenue": 0.0,
         "conversions": 0.0, "impressions": 0, "clicks": 0,
         "atc": 0.0, "checkout": 0.0, "ctr_sum": 0.0, "ctr_n": 0,
-        # Creative fields — static per ad, last value wins (they don't change)
+        # Creative fields — static per ad, last non-empty value wins
         "ad_title": "", "ad_body": "", "creative_type": "",
         "thumbnail_url": "", "image_url": "",
         "call_to_action": "", "destination_url": "",
+        # Status — most recent known value wins
+        "ad_status": "UNKNOWN",
     })
     for r in rows:
         ad_id = r["ad_id"]
@@ -570,6 +572,10 @@ def _aggregate_ad_rows(rows: list) -> list:
             val = r.get(field, "")
             if val:
                 agg[ad_id][field] = val
+        # Keep most recent known status
+        status = r.get("ad_status", "UNKNOWN") or "UNKNOWN"
+        if status != "UNKNOWN":
+            agg[ad_id]["ad_status"] = status
     result = []
     for ad_id, m in agg.items():
         sp   = round(m["spend"], 2)
@@ -579,6 +585,7 @@ def _aggregate_ad_rows(rows: list) -> list:
         result.append({
             "ad_id":           ad_id,
             "ad_name":         m["ad_name"],
+            "ad_status":       m["ad_status"],
             "spend":           sp,
             "revenue":         rev,
             "roas":            round(rev / sp, 2) if sp > 0 else 0.0,
@@ -714,7 +721,7 @@ def get_adset_ads(
     try:
         resp = (
             supabase.table("ad_daily_metrics")
-            .select("ad_id, ad_name, spend, revenue, roas, conversions, impressions, clicks, ctr, atc, checkout, ad_title, ad_body, creative_type, thumbnail_url, image_url, call_to_action, destination_url")
+            .select("ad_id, ad_name, ad_status, spend, revenue, roas, conversions, impressions, clicks, ctr, atc, checkout, ad_title, ad_body, creative_type, thumbnail_url, image_url, call_to_action, destination_url")
             .eq("adset_id", adset_id)
             .gte("date", date_from)
             .lte("date", date_to)
@@ -724,13 +731,13 @@ def get_adset_ads(
     except Exception:
         rows = []
 
-    # Check if rows exist but are missing creative data (first sync had no creatives)
+    # Check if rows exist but are missing creative data (first sync stored metrics only)
     missing_creatives = rows and all(not r.get("ad_title") and not r.get("thumbnail_url") for r in rows)
 
     if rows and not missing_creatives:
         return _aggregate_ad_rows(rows)
 
-    # No rows OR rows exist but lack creative data — find parent IDs and re-sync
+    # No rows OR rows have no creatives — find parent IDs
     try:
         adset_resp = (
             supabase.table("adset_daily_metrics")
@@ -748,11 +755,16 @@ def get_adset_ads(
 
     if account_id and background_tasks is not None:
         from app.services.ingest import IngestService
-        # skip_existing=False so it re-fetches creatives for all existing rows too
-        background_tasks.add_task(
-            IngestService.sync_ad_daily_metrics,
-            adset_id, campaign_id, account_id, date_from, date_to, False,
-        )
+        if missing_creatives:
+            # Fast path: rows exist but lack creatives — update only creative fields
+            # (single AdSet.get_ads() call instead of re-pulling all metrics)
+            background_tasks.add_task(IngestService.backfill_ad_creatives, adset_id)
+        else:
+            # No rows at all — need a full metrics + creative sync
+            background_tasks.add_task(
+                IngestService.sync_ad_daily_metrics,
+                adset_id, campaign_id, account_id, date_from, date_to, False,
+            )
 
     # Return whatever we have (metrics without creatives) while sync runs in background
     return _aggregate_ad_rows(rows) if rows else []
