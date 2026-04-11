@@ -355,67 +355,79 @@ def get_brand_detail(
             })
 
         # ── Campaigns ─────────────────────────────────────────────────────────
-        camp_resp = (
-            supabase.table("campaign_daily_metrics")
-            .select("campaign_id, campaign_name, account_id, spend, revenue, roas, conversions, impressions, clicks, ctr, atc, checkout")
+        # Step 1: fetch ALL known campaigns from the campaigns table — this is
+        # the source of truth for what exists today, independent of date range.
+        all_camps_resp = (
+            supabase.table("campaigns")
+            .select("id, name, status, account_id")
             .in_("account_id", list(account_ids))
-            .gte("date", date_from)
-            .lte("date", date_to)
             .execute()
         )
-        camp_rows = camp_resp.data or []
+        all_camps = all_camps_resp.data or []
+
+        # Step 2: fetch metrics for those campaigns over the selected date range.
+        campaign_ids_all = [c["id"] for c in all_camps]
         camp_agg: dict = defaultdict(lambda: {
             "campaign_name": "", "account_id": "",
             "spend": 0.0, "revenue": 0.0, "conversions": 0.0,
             "impressions": 0, "clicks": 0, "atc": 0.0, "checkout": 0.0,
             "ctr_sum": 0.0, "ctr_n": 0,
         })
-        for r in camp_rows:
-            cid = r["campaign_id"]
-            camp_agg[cid]["campaign_name"] = r.get("campaign_name") or cid
-            camp_agg[cid]["account_id"]    = r.get("account_id", "")
-            camp_agg[cid]["spend"]        += float(r.get("spend") or 0)
-            camp_agg[cid]["revenue"]      += float(r.get("revenue") or 0)
-            camp_agg[cid]["conversions"]  += float(r.get("conversions") or 0)
-            camp_agg[cid]["impressions"]  += int(r.get("impressions") or 0)
-            camp_agg[cid]["clicks"]       += int(r.get("clicks") or 0)
-            camp_agg[cid]["atc"]          += float(r.get("atc") or 0)
-            camp_agg[cid]["checkout"]     += float(r.get("checkout") or 0)
-            ctr = float(r.get("ctr") or 0)
-            if ctr > 0:
-                camp_agg[cid]["ctr_sum"] += ctr
-                camp_agg[cid]["ctr_n"]   += 1
 
-        campaign_ids = list(camp_agg.keys())
-        status_map = {}
-        if campaign_ids:
-            s_resp = supabase.table("campaigns").select("id, status").in_("id", campaign_ids).execute()
-            status_map = {c["id"]: c.get("status", "ACTIVE") for c in s_resp.data or []}
+        if campaign_ids_all:
+            camp_resp = (
+                supabase.table("campaign_daily_metrics")
+                .select("campaign_id, campaign_name, account_id, spend, revenue, conversions, impressions, clicks, ctr, atc, checkout")
+                .in_("campaign_id", campaign_ids_all)
+                .gte("date", date_from)
+                .lte("date", date_to)
+                .execute()
+            )
+            for r in (camp_resp.data or []):
+                cid = r["campaign_id"]
+                camp_agg[cid]["campaign_name"] = r.get("campaign_name") or cid
+                camp_agg[cid]["account_id"]    = r.get("account_id", "")
+                camp_agg[cid]["spend"]        += float(r.get("spend") or 0)
+                camp_agg[cid]["revenue"]      += float(r.get("revenue") or 0)
+                camp_agg[cid]["conversions"]  += float(r.get("conversions") or 0)
+                camp_agg[cid]["impressions"]  += int(r.get("impressions") or 0)
+                camp_agg[cid]["clicks"]       += int(r.get("clicks") or 0)
+                camp_agg[cid]["atc"]          += float(r.get("atc") or 0)
+                camp_agg[cid]["checkout"]     += float(r.get("checkout") or 0)
+                ctr = float(r.get("ctr") or 0)
+                if ctr > 0:
+                    camp_agg[cid]["ctr_sum"] += ctr
+                    camp_agg[cid]["ctr_n"]   += 1
 
+        # Step 3: build result from the campaigns table — every campaign appears
+        # regardless of whether it had spend in the selected date range.
         campaigns = []
-        for cid, m in camp_agg.items():
-            sp  = round(m["spend"], 2)
-            rev = round(m["revenue"], 2)
-            clk = m["clicks"]
-            conv = round(m["conversions"], 1)
+        for c in all_camps:
+            cid = c["id"]
+            m   = camp_agg.get(cid, {})
+            sp  = round(float(m.get("spend", 0)), 2)
+            rev = round(float(m.get("revenue", 0)), 2)
+            clk = int(m.get("clicks", 0))
+            conv = round(float(m.get("conversions", 0)), 1)
             campaigns.append({
                 "campaign_id":   cid,
-                "status":        status_map.get(cid, "ACTIVE"),
-                "campaign_name": m["campaign_name"],
-                "account_id":    m["account_id"],
+                "status":        c.get("status", "UNKNOWN"),
+                "campaign_name": m.get("campaign_name") or c.get("name") or cid,
+                "account_id":    c.get("account_id", ""),
                 "spend":         sp,
                 "revenue":       rev,
                 "roas":          round(rev / sp, 2) if sp > 0 else 0.0,
                 "conversions":   conv,
-                "impressions":   m["impressions"],
+                "impressions":   int(m.get("impressions", 0)),
                 "clicks":        clk,
-                "ctr":           round(m["ctr_sum"] / m["ctr_n"], 2) if m["ctr_n"] > 0 else 0.0,
-                "atc":           int(m["atc"]),
-                "checkout":      int(m["checkout"]),
+                "ctr":           round(m["ctr_sum"] / m["ctr_n"], 2) if m.get("ctr_n", 0) > 0 else 0.0,
+                "atc":           int(m.get("atc", 0)),
+                "checkout":      int(m.get("checkout", 0)),
                 "cvr":           round(conv / clk * 100, 2) if clk > 0 else 0.0,
                 "cpa":           round(sp / conv, 2) if conv > 0 else None,
             })
-        campaigns.sort(key=lambda x: x["spend"], reverse=True)
+        # Active (live) campaigns first, then by spend descending
+        campaigns.sort(key=lambda x: (x["status"] != "ACTIVE", -x["spend"]))
 
         return {
             "brand": {
