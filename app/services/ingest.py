@@ -365,18 +365,15 @@ class IngestService:
         # Fetch and store current campaign statuses once per account sync
         try:
             FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN, api_version='v22.0')
-            camps = AdAccount(norm_id).get_campaigns(fields=["id", "name", "effective_status", "created_time"], params={"limit": 1000})
+            camps = AdAccount(norm_id).get_campaigns(fields=["id", "name", "effective_status"], params={"limit": 1000})
             for c in camps:
-                row = {
+                supabase.table("campaigns").upsert({
                     "id":         c.get("id"),
                     "account_id": clean_id,
                     "name":       c.get("name", ""),
                     "status":     c.get("effective_status", "ACTIVE"),
                     "updated_at": datetime.utcnow().isoformat(),
-                }
-                if c.get("created_time"):
-                    row["created_at"] = c["created_time"]
-                supabase.table("campaigns").upsert(row, on_conflict="id").execute()
+                }, on_conflict="id").execute()
         except Exception as e:
             print(f"[ingest] failed to sync campaign statuses for {clean_id}: {e}")
 

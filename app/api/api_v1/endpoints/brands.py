@@ -359,7 +359,7 @@ def get_brand_detail(
         # the source of truth for what exists today, independent of date range.
         all_camps_resp = (
             supabase.table("campaigns")
-            .select("id, name, status, account_id, created_at")
+            .select("id, name, status, account_id")
             .in_("account_id", list(account_ids))
             .execute()
         )
@@ -430,7 +430,7 @@ def get_brand_detail(
                 "status":        c.get("status", "UNKNOWN"),
                 "campaign_name": m.get("campaign_name") or c.get("name") or cid,
                 "account_id":    c.get("account_id", ""),
-                "created_at":    c.get("created_at") or first_seen.get(cid),
+                "created_at":    first_seen.get(cid),
                 "spend":         sp,
                 "revenue":       rev,
                 "roas":          round(rev / sp, 2) if sp > 0 else 0.0,
