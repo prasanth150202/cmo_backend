@@ -359,7 +359,7 @@ def get_brand_detail(
         # the source of truth for what exists today, independent of date range.
         all_camps_resp = (
             supabase.table("campaigns")
-            .select("id, name, status, account_id")
+            .select("id, name, status, account_id, created_at")
             .in_("account_id", list(account_ids))
             .execute()
         )
@@ -373,6 +373,22 @@ def get_brand_detail(
             "impressions": 0, "clicks": 0, "atc": 0.0, "checkout": 0.0,
             "ctr_sum": 0.0, "ctr_n": 0,
         })
+
+        # Earliest date each campaign ever appeared — used as created_at fallback
+        first_seen: dict = {}
+        if campaign_ids_all:
+            earliest_resp = (
+                supabase.table("campaign_daily_metrics")
+                .select("campaign_id, date")
+                .in_("campaign_id", campaign_ids_all)
+                .order("date", desc=False)
+                .execute()
+            )
+            for r in (earliest_resp.data or []):
+                cid = r["campaign_id"]
+                d   = str(r["date"])[:10]
+                if cid not in first_seen or d < first_seen[cid]:
+                    first_seen[cid] = d
 
         if campaign_ids_all:
             camp_resp = (
@@ -414,6 +430,7 @@ def get_brand_detail(
                 "status":        c.get("status", "UNKNOWN"),
                 "campaign_name": m.get("campaign_name") or c.get("name") or cid,
                 "account_id":    c.get("account_id", ""),
+                "created_at":    c.get("created_at") or first_seen.get(cid),
                 "spend":         sp,
                 "revenue":       rev,
                 "roas":          round(rev / sp, 2) if sp > 0 else 0.0,
