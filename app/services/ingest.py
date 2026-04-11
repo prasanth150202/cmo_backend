@@ -574,16 +574,21 @@ class IngestService:
             return {}
 
         def _extract_from_oss(oss: dict) -> tuple:
-            title, body, dest_url, cta = "", "", "", ""
+            """Returns (title, body, dest_url, cta, thumbnail)."""
+            title, body, dest_url, cta, thumbnail = "", "", "", "", ""
+            # Link-share / SHARE type ads
             ld = _safe_dict(oss.get("link_data"))
             if ld:
-                title    = title    or ld.get("name", "")
-                body     = body     or ld.get("message", "")
-                dest_url = dest_url or ld.get("link", "")
-                cta_obj  = _safe_dict(ld.get("call_to_action"))
-                cta      = cta      or cta_obj.get("type", "")
+                title     = title     or ld.get("name", "")
+                body      = body      or ld.get("message", "")
+                dest_url  = dest_url  or ld.get("link", "")
+                # picture field carries the OG image for SHARE/link-preview ads
+                thumbnail = thumbnail or ld.get("picture", "") or ld.get("image_url", "")
+                cta_obj   = _safe_dict(ld.get("call_to_action"))
+                cta       = cta       or cta_obj.get("type", "")
                 if not dest_url:
                     dest_url = _safe_dict(cta_obj.get("value")).get("link", "")
+            # Video ads
             vd = _safe_dict(oss.get("video_data"))
             if vd:
                 title    = title    or vd.get("title", "")
@@ -592,11 +597,12 @@ class IngestService:
                 cta      = cta      or cta_obj.get("type", "")
                 if not dest_url:
                     dest_url = _safe_dict(cta_obj.get("value")).get("link", "")
+            # Carousel / multi-share
             md = _safe_dict(oss.get("template_data") or oss.get("multi_share_data"))
             if md:
                 body     = body     or md.get("message", "")
                 dest_url = dest_url or md.get("link", "")
-            return title, body, dest_url, cta
+            return title, body, dest_url, cta, thumbnail
 
         try:
             ads = AdSet(adset_id).get_ads(
@@ -623,11 +629,13 @@ class IngestService:
                 dest_url  = cr.get("link_url", "")
                 oss = _safe_dict(cr.get("object_story_spec"))
                 if oss:
-                    t2, b2, d2, c2 = _extract_from_oss(oss)
-                    title    = title    or t2
-                    body     = body     or b2
-                    dest_url = dest_url or d2
-                    cta      = cta      or c2
+                    t2, b2, d2, c2, th2 = _extract_from_oss(oss)
+                    title     = title     or t2
+                    body      = body      or b2
+                    dest_url  = dest_url  or d2
+                    cta       = cta       or c2
+                    thumbnail = thumbnail or th2
+                    image_url = image_url or th2
                 result[ad_id] = {
                     "ad_title":        title,
                     "ad_body":         body,
