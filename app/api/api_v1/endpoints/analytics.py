@@ -105,7 +105,7 @@ def _fetch_daily_from_meta(date_from: str, date_to: str, brand_id: Optional[str]
     if not settings.META_SYSTEM_USER_TOKEN:
         return []
 
-    FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+    FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN, api_version='v22.0')
 
     try:
         query = supabase.table("brand_accounts").select("account_id, platform")
@@ -247,7 +247,7 @@ def _fetch_account_totals(date_from: str, date_to: str) -> dict:
     if not settings.META_SYSTEM_USER_TOKEN:
         return {}
 
-    FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+    FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN, api_version='v22.0')
 
     try:
         accts_resp = supabase.table("brand_accounts").select("account_id, platform").execute()

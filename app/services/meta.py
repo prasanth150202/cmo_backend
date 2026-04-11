@@ -16,7 +16,7 @@ def _extract_action(data: Optional[List[Dict]], action_type: str) -> float:
 class MetaService:
     def __init__(self):
         if settings.META_SYSTEM_USER_TOKEN:
-            FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+            FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN, api_version='v22.0')
 
     def get_account_metrics(self, ad_account_id: str) -> List[Dict[str, Any]]:
         """

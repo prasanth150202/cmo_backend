@@ -60,7 +60,7 @@ def _pull_chunk(account_id: str, date_from: str, date_to: str) -> int:
     from facebook_business.adobjects.adaccount import AdAccount
     from app.core.config import settings
 
-    FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+    FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN, api_version='v22.0')
     norm_id  = account_id if account_id.startswith("act_") else f"act_{account_id}"
     clean_id = account_id.replace("act_", "")
 
@@ -152,7 +152,7 @@ def _pull_campaign_chunk(account_id: str, date_from: str, date_to: str) -> int:
     from facebook_business.adobjects.adaccount import AdAccount
     from app.core.config import settings
 
-    FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+    FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN, api_version='v22.0')
     norm_id  = account_id if account_id.startswith("act_") else f"act_{account_id}"
     clean_id = account_id.replace("act_", "")
 
@@ -364,7 +364,7 @@ class IngestService:
 
         # Fetch and store current campaign statuses once per account sync
         try:
-            FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+            FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN, api_version='v22.0')
             camps = AdAccount(norm_id).get_campaigns(fields=["id", "name", "effective_status"], params={"limit": 1000})
             for c in camps:
                 supabase.table("campaigns").upsert({
@@ -458,7 +458,7 @@ class IngestService:
         if not settings.META_SYSTEM_USER_TOKEN:
             return {"error": "META_SYSTEM_USER_TOKEN not configured", "rows_synced": 0}
 
-        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN, api_version='v22.0')
         clean_account = account_id.replace("act_", "")
 
         # Check what's already stored
@@ -659,35 +659,71 @@ class IngestService:
                     or cr.get("object_story_id", "")
                 )
                 if obj_type == "SHARE":
-                    print(f"[creative] SHARE ad={ad_id} story_id={story_id!r} title={title!r} body={body[:30]!r} thumb={bool(thumbnail)} cr_keys={list(cr.keys())}")
+                    print(f"[creative] SHARE ad={ad_id} story_id={story_id!r} title={title!r} body={body[:30]!r} thumb={bool(thumbnail)}")
+                    print(f"[creative] SHARE oss content: {oss}")
                 if obj_type == "SHARE" and story_id and (not title or not body):
                     share_story_ids[ad_id] = story_id
 
-            # ── Batch-fetch page post content for all SHARE ads ──────────────────
-            # SHARE ads store title/body/image in the original page post, not in
-            # the creative object. One extra API call fetches all of them at once.
+            # ── Fetch page post content for all SHARE ads ────────────────────────
+            # The System User token can't read page posts directly — need a Page
+            # Access Token. Strategy: get page token once per unique page_id, then
+            # fetch posts. Falls back to SDK call if page token unavailable.
             if share_story_ids:
                 try:
                     import httpx
                     from app.core.config import settings as _settings
+
+                    # Group story IDs by page_id so we fetch page tokens once per page
+                    page_stories: Dict[str, List[str]] = {}  # page_id → [story_id, ...]
+                    for sid in set(share_story_ids.values()):
+                        page_id = sid.split("_")[0] if "_" in sid else ""
+                        if page_id:
+                            page_stories.setdefault(page_id, []).append(sid)
+
+                    # Fetch page access tokens for each page (system user must be page admin)
+                    page_tokens: Dict[str, str] = {}
+                    for page_id in page_stories:
+                        try:
+                            pt_resp = httpx.get(
+                                f"https://graph.facebook.com/v22.0/{page_id}",
+                                params={
+                                    "fields":       "access_token",
+                                    "access_token": _settings.META_SYSTEM_USER_TOKEN,
+                                },
+                                timeout=15,
+                            )
+                            pt_data = pt_resp.json()
+                            page_tokens[page_id] = pt_data.get("access_token", _settings.META_SYSTEM_USER_TOKEN)
+                            print(f"[creative] page_token for {page_id}: {'got it' if 'access_token' in pt_data else 'not found, using system token'}")
+                        except Exception as e:
+                            page_tokens[page_id] = _settings.META_SYSTEM_USER_TOKEN
+                            print(f"[creative] page token fetch failed for {page_id}: {e}")
+
+                    # Fetch each story's post content using its page token
+                    posts_data: Dict[str, dict] = {}
                     unique_stories = list(set(share_story_ids.values()))
-                    print(f"[creative] fetching {len(unique_stories)} SHARE posts: {unique_stories}")
-                    resp = httpx.get(
-                        "https://graph.facebook.com/v19.0/",
-                        params={
-                            "ids":          ",".join(unique_stories),
-                            "fields":       "message,full_picture,attachments{title,description,url_tags}",
-                            "access_token": _settings.META_SYSTEM_USER_TOKEN,
-                        },
-                        timeout=30,
-                    )
-                    posts_data: dict = resp.json() if resp.is_success else {}
-                    print(f"[creative] SHARE post API response keys: {list(posts_data.keys())}")
+                    for sid in unique_stories:
+                        page_id = sid.split("_")[0] if "_" in sid else ""
+                        token   = page_tokens.get(page_id, _settings.META_SYSTEM_USER_TOKEN)
+                        try:
+                            p_resp = httpx.get(
+                                f"https://graph.facebook.com/v22.0/{sid}",
+                                params={
+                                    "fields":       "message,full_picture,attachments{title,description,url_tags}",
+                                    "access_token": token,
+                                },
+                                timeout=15,
+                            )
+                            p_data = p_resp.json()
+                            print(f"[creative] post fetch {sid}: status={p_resp.status_code} keys={list(p_data.keys())}")
+                            if "id" in p_data or "message" in p_data:
+                                posts_data[sid] = p_data
+                        except Exception as e:
+                            print(f"[creative] post fetch failed for {sid}: {e}")
 
                     for ad_id, story_id in share_story_ids.items():
                         post = posts_data.get(story_id, {})
                         if not post:
-                            print(f"[creative] no post data for story_id={story_id}")
                             continue
                         post_body = post.get("message", "")
                         post_pic  = post.get("full_picture", "")
@@ -696,7 +732,7 @@ class IngestService:
                         att_title = att.get("title", "")
                         att_desc  = att.get("description", "")
 
-                        print(f"[creative] SHARE ad={ad_id} story={story_id} body={post_body[:40]!r} title={att_title!r} pic={bool(post_pic)}")
+                        print(f"[creative] SHARE filled ad={ad_id} body={post_body[:40]!r} title={att_title!r} pic={bool(post_pic)}")
 
                         if not result[ad_id]["ad_title"]:
                             result[ad_id]["ad_title"] = att_title
@@ -707,7 +743,7 @@ class IngestService:
                             result[ad_id]["image_url"]     = post_pic
 
                 except Exception as e:
-                    print(f"[creative] SHARE post batch fetch failed: {e}")
+                    print(f"[creative] SHARE post fetch failed: {e}")
 
             print(f"[creative] batch fetched {len(result)} ads for adset {adset_id}")
             return result
@@ -735,7 +771,7 @@ class IngestService:
         if not settings.META_SYSTEM_USER_TOKEN:
             return {"error": "META_SYSTEM_USER_TOKEN not configured", "rows_synced": 0}
 
-        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN, api_version='v22.0')
         clean_account = account_id.replace("act_", "")
 
         covered: set = set()
@@ -866,7 +902,7 @@ class IngestService:
         if not settings.META_SYSTEM_USER_TOKEN:
             return {"error": "META_SYSTEM_USER_TOKEN not configured", "updated": 0}
 
-        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN)
+        FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN, api_version='v22.0')
         ads_meta = IngestService._fetch_ads_metadata(adset_id)
 
         if not ads_meta:
