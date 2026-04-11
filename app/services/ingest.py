@@ -609,11 +609,16 @@ class IngestService:
                 fields=[
                     "id", "name", "effective_status",
                     "creative{title,body,object_type,thumbnail_url,image_url,"
-                    "call_to_action_type,link_url,object_story_spec}",
+                    "call_to_action_type,link_url,object_story_spec,"
+                    # SHARE type ads store post content behind this ID
+                    "effective_object_story_id}",
                 ],
                 params={"limit": 500},
             )
             result: Dict[str, Dict] = {}
+            # Map ad_id → effective_object_story_id for SHARE type ads
+            share_story_ids: Dict[str, str] = {}
+
             for ad in ads:
                 d     = _safe_dict(ad)
                 ad_id = d.get("id", "")
@@ -636,6 +641,7 @@ class IngestService:
                     cta       = cta       or c2
                     thumbnail = thumbnail or th2
                     image_url = image_url or th2
+
                 result[ad_id] = {
                     "ad_title":        title,
                     "ad_body":         body,
@@ -646,6 +652,55 @@ class IngestService:
                     "destination_url": dest_url,
                     "ad_status":       d.get("effective_status", "UNKNOWN"),
                 }
+
+                # Queue SHARE ads for a post-content fetch
+                story_id = cr.get("effective_object_story_id", "")
+                if obj_type == "SHARE" and story_id and (not title or not body):
+                    share_story_ids[ad_id] = story_id
+
+            # ── Batch-fetch page post content for all SHARE ads ──────────────────
+            # SHARE ads store title/body/image in the original page post, not in
+            # the creative object. One extra API call fetches all of them at once.
+            if share_story_ids:
+                try:
+                    import requests as _requests
+                    from app.core.config import settings as _settings
+                    unique_stories = list(set(share_story_ids.values()))
+                    resp = _requests.get(
+                        "https://graph.facebook.com/v19.0/",
+                        params={
+                            "ids":          ",".join(unique_stories),
+                            "fields":       "message,full_picture,attachments{title,description,url_tags}",
+                            "access_token": _settings.META_SYSTEM_USER_TOKEN,
+                        },
+                        timeout=30,
+                    )
+                    posts_data: dict = resp.json() if resp.ok else {}
+
+                    for ad_id, story_id in share_story_ids.items():
+                        post = posts_data.get(story_id, {})
+                        if not post:
+                            continue
+                        post_body = post.get("message", "")
+                        post_pic  = post.get("full_picture", "")
+                        # Title / description live in the first attachment
+                        att_list  = post.get("attachments", {}).get("data", [{}])
+                        att       = att_list[0] if att_list else {}
+                        att_title = att.get("title", "")
+                        att_desc  = att.get("description", "")
+
+                        if not result[ad_id]["ad_title"]:
+                            result[ad_id]["ad_title"] = att_title
+                        if not result[ad_id]["ad_body"]:
+                            result[ad_id]["ad_body"] = post_body or att_desc
+                        if not result[ad_id]["thumbnail_url"] and post_pic:
+                            result[ad_id]["thumbnail_url"] = post_pic
+                            result[ad_id]["image_url"]     = post_pic
+
+                    print(f"[creative] SHARE post fetch: {len(unique_stories)} posts for {len(share_story_ids)} ads")
+                except Exception as e:
+                    print(f"[creative] SHARE post batch fetch failed: {e}")
+
             print(f"[creative] batch fetched {len(result)} ads for adset {adset_id}")
             return result
         except Exception as e:
