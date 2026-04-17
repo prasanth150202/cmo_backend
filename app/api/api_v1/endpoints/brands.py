@@ -248,8 +248,6 @@ def get_brand_detail(
     if not date_from or not date_to:
         date_from, date_to = _default_dates()
 
-    try:
-    from collections import defaultdict
     from datetime import datetime, timedelta
 
     try:
