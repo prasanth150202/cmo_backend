@@ -520,14 +520,15 @@ def _fetch_brand_funnel(account_ids: list, date_from: str, date_to: str) -> dict
         return {}
 
 
-def _aggregate_adset_rows(rows: list) -> list:
-    """Aggregate adset_daily_metrics rows (multiple dates) into per-adset totals."""
+def _aggregate_adset_rows(rows: list) -> dict:
+    """Aggregate adset_daily_metrics rows into per-adset totals + return latest sync time."""
     from collections import defaultdict
     agg: dict = defaultdict(lambda: {
         "adset_name": "", "spend": 0.0, "revenue": 0.0,
         "conversions": 0.0, "impressions": 0, "clicks": 0,
         "atc": 0.0, "checkout": 0.0, "ctr_sum": 0.0, "ctr_n": 0,
     })
+    latest_sync = None
     for r in rows:
         aid = r["adset_id"]
         agg[aid]["adset_name"]  = r.get("adset_name") or aid
@@ -542,13 +543,20 @@ def _aggregate_adset_rows(rows: list) -> list:
         if ctr > 0:
             agg[aid]["ctr_sum"] += ctr
             agg[aid]["ctr_n"]   += 1
-    result = []
+        
+        # Track latest sync time
+        sync_time = r.get("synced_at")
+        if sync_time:
+            if latest_sync is None or sync_time > latest_sync:
+                latest_sync = sync_time
+
+    adsets = []
     for aid, m in agg.items():
         sp   = round(m["spend"], 2)
         rev  = round(m["revenue"], 2)
         clk  = m["clicks"]
         conv = round(m["conversions"], 1)
-        result.append({
+        adsets.append({
             "adset_id":    aid,
             "adset_name":  m["adset_name"],
             "spend":       sp,
@@ -563,12 +571,12 @@ def _aggregate_adset_rows(rows: list) -> list:
             "cvr":         round(conv / clk * 100, 2) if clk > 0 else 0.0,
             "cpa":         round(sp / conv, 2) if conv > 0 else None,
         })
-    result.sort(key=lambda x: x["spend"], reverse=True)
-    return result
+    adsets.sort(key=lambda x: x["spend"], reverse=True)
+    return {"data": adsets, "last_synced": latest_sync}
 
 
-def _aggregate_ad_rows(rows: list) -> list:
-    """Aggregate ad_daily_metrics rows into per-ad totals, preserving creative fields."""
+def _aggregate_ad_rows(rows: list) -> dict:
+    """Aggregate ad_daily_metrics rows into per-ad totals + return latest sync time."""
     from collections import defaultdict
     agg: dict = defaultdict(lambda: {
         "ad_name": "", "spend": 0.0, "revenue": 0.0,
@@ -581,6 +589,7 @@ def _aggregate_ad_rows(rows: list) -> list:
         # Status — most recent known value wins
         "ad_status": "UNKNOWN",
     })
+    latest_sync = None
     for r in rows:
         ad_id = r["ad_id"]
         agg[ad_id]["ad_name"]     = r.get("ad_name") or ad_id
@@ -605,13 +614,20 @@ def _aggregate_ad_rows(rows: list) -> list:
         status = r.get("ad_status", "UNKNOWN") or "UNKNOWN"
         if status != "UNKNOWN":
             agg[ad_id]["ad_status"] = status
-    result = []
+        
+        # Track latest sync time
+        sync_time = r.get("synced_at")
+        if sync_time:
+            if latest_sync is None or sync_time > latest_sync:
+                latest_sync = sync_time
+
+    ads = []
     for ad_id, m in agg.items():
         sp   = round(m["spend"], 2)
         rev  = round(m["revenue"], 2)
         clk  = m["clicks"]
         conv = round(m["conversions"], 1)
-        result.append({
+        ads.append({
             "ad_id":           ad_id,
             "ad_name":         m["ad_name"],
             "ad_status":       m["ad_status"],
@@ -634,8 +650,8 @@ def _aggregate_ad_rows(rows: list) -> list:
             "call_to_action":  m["call_to_action"],
             "destination_url": m["destination_url"],
         })
-    result.sort(key=lambda x: x["spend"], reverse=True)
-    return result
+    ads.sort(key=lambda x: x["spend"], reverse=True)
+    return {"data": ads, "last_synced": latest_sync}
 
 
 @router.get("/{brand_id}/campaigns/{campaign_id}/adsets")
@@ -659,7 +675,7 @@ def get_campaign_adsets(
     try:
         resp = (
             supabase.table("adset_daily_metrics")
-            .select("adset_id, adset_name, spend, revenue, roas, conversions, impressions, clicks, ctr, atc, checkout")
+            .select("adset_id, adset_name, spend, revenue, roas, conversions, impressions, clicks, ctr, atc, checkout, synced_at")
             .eq("campaign_id", campaign_id)
             .gte("date", date_from)
             .lte("date", date_to)
@@ -669,10 +685,20 @@ def get_campaign_adsets(
     except Exception:
         rows = []
 
+    # Check for staleness (6 hours)
+    is_stale = False
+    agg_result = {"data": [], "last_synced": None}
     if rows:
-        return _aggregate_adset_rows(rows)
+        agg_result = _aggregate_adset_rows(rows)
+        if agg_result["last_synced"]:
+            last_sync = datetime.fromisoformat(agg_result["last_synced"].replace("Z", "+00:00"))
+            if datetime.now(last_sync.tzinfo) - last_sync > timedelta(hours=6):
+                is_stale = True
 
-    # 2. No DB data — find account_id for this campaign then trigger background sync
+    if rows and not is_stale:
+        return agg_result["data"]
+
+    # 2. No DB data OR stale — find account_id for this campaign then trigger background sync
     try:
         camp_resp = (
             supabase.table("campaign_daily_metrics")
@@ -689,10 +715,11 @@ def get_campaign_adsets(
         from app.services.ingest import IngestService
         background_tasks.add_task(
             IngestService.sync_adset_daily_metrics,
-            campaign_id, account_id, date_from, date_to,
+            campaign_id, account_id, date_from, date_to, False if is_stale else True,
         )
 
-    return []
+    # Return whatever we have (or empty) while sync runs in background
+    return agg_result["data"]
 
 
 @router.post("/{brand_id}/campaigns/{campaign_id}/adsets/sync")
@@ -750,7 +777,7 @@ def get_adset_ads(
     try:
         resp = (
             supabase.table("ad_daily_metrics")
-            .select("ad_id, ad_name, ad_status, spend, revenue, roas, conversions, impressions, clicks, ctr, atc, checkout, ad_title, ad_body, creative_type, thumbnail_url, image_url, call_to_action, destination_url")
+            .select("ad_id, ad_name, ad_status, spend, revenue, roas, conversions, impressions, clicks, ctr, atc, checkout, ad_title, ad_body, creative_type, thumbnail_url, image_url, call_to_action, destination_url, synced_at")
             .eq("adset_id", adset_id)
             .gte("date", date_from)
             .lte("date", date_to)
@@ -762,11 +789,21 @@ def get_adset_ads(
 
     # Check if rows exist but are missing creative data (first sync stored metrics only)
     missing_creatives = rows and all(not r.get("ad_title") and not r.get("thumbnail_url") for r in rows)
+    
+    # Check for staleness (6 hours)
+    is_stale = False
+    agg_result = {"data": [], "last_synced": None}
+    if rows:
+        agg_result = _aggregate_ad_rows(rows)
+        if agg_result["last_synced"]:
+            last_sync = datetime.fromisoformat(agg_result["last_synced"].replace("Z", "+00:00"))
+            if datetime.now(last_sync.tzinfo) - last_sync > timedelta(hours=6):
+                is_stale = True
 
-    if rows and not missing_creatives:
-        return _aggregate_ad_rows(rows)
+    if rows and not missing_creatives and not is_stale:
+        return agg_result["data"]
 
-    # No rows OR rows have no creatives — find parent IDs
+    # No rows OR rows have no creatives OR stale — find parent IDs
     try:
         adset_resp = (
             supabase.table("adset_daily_metrics")
@@ -784,19 +821,18 @@ def get_adset_ads(
 
     if account_id and background_tasks is not None:
         from app.services.ingest import IngestService
-        if missing_creatives:
+        if missing_creatives and not is_stale:
             # Fast path: rows exist but lack creatives — update only creative fields
-            # (single AdSet.get_ads() call instead of re-pulling all metrics)
             background_tasks.add_task(IngestService.backfill_ad_creatives, adset_id)
         else:
-            # No rows at all — need a full metrics + creative sync
+            # No rows at all OR stale — need a full metrics + creative sync
             background_tasks.add_task(
                 IngestService.sync_ad_daily_metrics,
-                adset_id, campaign_id, account_id, date_from, date_to, False,
+                adset_id, campaign_id, account_id, date_from, date_to, False if is_stale else True,
             )
 
     # Return whatever we have (metrics without creatives) while sync runs in background
-    return _aggregate_ad_rows(rows) if rows else []
+    return agg_result["data"]
 
 
 @router.post("/{brand_id}/adsets/{adset_id}/ads/sync")
