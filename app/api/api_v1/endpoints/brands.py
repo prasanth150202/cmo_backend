@@ -249,54 +249,101 @@ def get_brand_detail(
         date_from, date_to = _default_dates()
 
     try:
-        brand_resp = supabase.table("brands").select("*").eq("id", brand_id).execute()
-        if not brand_resp.data:
-            raise HTTPException(status_code=404, detail="Brand not found")
-        brand = brand_resp.data[0]
+    from collections import defaultdict
+    from datetime import datetime, timedelta
 
-        accts_resp = supabase.table("brand_accounts").select("*").eq("brand_id", brand_id).execute()
-        accounts = accts_resp.data or []
-        account_ids = {a["account_id"].replace("act_", "") for a in accounts}
+    try:
+        brand = (
+            supabase.table("brands")
+            .select("id, name, color, logo_url, website_url, industry, target_roas")
+            .eq("id", brand_id)
+            .single()
+            .execute()
+        ).data
+        if not brand:
+            raise HTTPException(status_code=404, detail="Brand not found")
+
+        # ── Fetch accounts for this brand ──────────────────────────────────────
+        accounts = (
+            supabase.table("brand_accounts")
+            .select("account_id, platform, account_name")
+            .eq("brand_id", brand_id)
+            .execute()
+        ).data or []
+        account_ids = [a["account_id"].replace("act_", "") for a in accounts]
+
+        if not date_from or not date_to:
+            from app.api.api_v1.endpoints.analytics import _default_dates
+            date_from, date_to = _default_dates()
 
         if not account_ids:
-            return {"brand": brand, "accounts": [], "today": {}, "daily": [], "funnel": {}}
+            return {
+                "brand": brand, "summary": {}, "daily": [], 
+                "funnel": {}, "scorecard": [], "campaigns": [],
+                "date_from": date_from, "date_to": date_to, "last_synced": None
+            }
 
-        # ── Daily time-series from local store ─────────────────────────────────
+        # ── Daily Metrics (Aggregated over accounts) ──────────────────────────
+        # Include synced_at to check for staleness
         daily_resp = (
             supabase.table("daily_metrics")
-            .select("*")
+            .select("date, spend, revenue, impressions, clicks, conversions, ctr_sum, ctr_n, account_id, synced_at")
             .in_("account_id", list(account_ids))
             .gte("date", date_from)
             .lte("date", date_to)
-            .order("date")
+            .order("date", desc=False)
             .execute()
         )
         daily_rows = daily_resp.data or []
 
-        # Aggregate by date
-        by_date: dict = defaultdict(lambda: {"spend": 0.0, "revenue": 0.0, "impressions": 0, "clicks": 0, "ctr_sum": 0.0, "ctr_n": 0, "conversions": 0.0})
+        # Check for staleness (6 hours)
+        latest_sync = None
         for r in daily_rows:
-            d = str(r["date"])[:10]
-            by_date[d]["spend"]       += float(r.get("spend") or 0)
-            by_date[d]["revenue"]     += float(r.get("revenue") or 0)
-            by_date[d]["impressions"] += int(r.get("impressions") or 0)
-            by_date[d]["clicks"]      += int(r.get("clicks") or 0)
-            by_date[d]["conversions"] += float(r.get("conversions") or 0)
-            ctr = float(r.get("ctr") or 0)
-            if ctr > 0:
-                by_date[d]["ctr_sum"] += ctr
-                by_date[d]["ctr_n"]   += 1
+            st = r.get("synced_at")
+            if st:
+                if latest_sync is None or st > latest_sync:
+                    latest_sync = st
+        
+        is_stale = False
+        if latest_sync:
+            ls_dt = datetime.fromisoformat(latest_sync.replace("Z", "+00:00"))
+            if datetime.now(ls_dt.tzinfo) - ls_dt > timedelta(hours=6):
+                is_stale = True
+
+        # If data is missing OR stale, trigger background sync
+        if (not daily_rows or is_stale) and background_tasks is not None:
+            from app.services.ingest import IngestService
+            # Logic for multi-account brand sync
+            for acct in accounts:
+                clean_id = acct["account_id"].replace("act_", "")
+                # Force sync if stale (skip_existing=False)
+                background_tasks.add_task(
+                    IngestService.sync_daily_metrics,
+                    clean_id, date_from, date_to, False if is_stale else True
+                )
+
+        daily_agg_dict: dict = {}
+        for row in daily_rows:
+            date = str(row["date"])
+            if date not in daily_agg_dict:
+                daily_agg_dict[date] = {"date": date, "spend": 0.0, "revenue": 0.0, "impressions": 0, "clicks": 0, "conversions": 0.0, "ctr_sum": 0.0, "ctr_n": 0}
+            
+            daily_agg_dict[date]["spend"]       += float(row["spend"] or 0)
+            daily_agg_dict[date]["revenue"]     += float(row["revenue"] or 0)
+            daily_agg_dict[date]["impressions"] += int(row["impressions"] or 0)
+            daily_agg_dict[date]["clicks"]      += int(row["clicks"] or 0)
+            daily_agg_dict[date]["conversions"] += float(row["conversions"] or 0)
+            daily_agg_dict[date]["ctr_sum"]     += float(row["ctr_sum"] or 0)
+            daily_agg_dict[date]["ctr_n"]       += int(row["ctr_n"] or 0)
 
         daily_agg = []
-        for d in sorted(by_date.keys()):
-            row = by_date[d]
-            sp  = round(row["spend"], 2)
-            rev = round(row["revenue"], 2)
+        for date in sorted(daily_agg_dict.keys()):
+            row = daily_agg_dict[date]
             daily_agg.append({
-                "date":        d,
-                "spend":       sp,
-                "revenue":     rev,
-                "roas":        round(rev / sp, 2) if sp > 0 else 0.0,
+                "date":        date,
+                "spend":       round(row["spend"], 2),
+                "revenue":     round(row["revenue"], 2),
+                "roas":        round(row["revenue"] / row["spend"], 2) if row["spend"] > 0 else 0.0,
                 "impressions": row["impressions"],
                 "clicks":      row["clicks"],
                 "conversions": round(row["conversions"], 1),
@@ -304,13 +351,13 @@ def get_brand_detail(
             })
 
         # ── Aggregate over the full selected date range ────────────────────────
-        total_spend       = round(sum(float(r.get("spend") or 0) for r in daily_rows), 2)
-        total_revenue     = round(sum(float(r.get("revenue") or 0) for r in daily_rows), 2)
+        total_spend       = round(sum(float(r["spend"]) for r in daily_agg), 2)
+        total_revenue     = round(sum(float(r["revenue"]) for r in daily_agg), 2)
         total_roas        = round(total_revenue / total_spend, 2) if total_spend > 0 else 0.0
-        total_impressions = sum(int(r.get("impressions") or 0) for r in daily_rows)
-        total_clicks      = sum(int(r.get("clicks") or 0) for r in daily_rows)
-        total_conversions = round(sum(float(r.get("conversions") or 0) for r in daily_rows), 1)
-        ctr_vals          = [float(r.get("ctr") or 0) for r in daily_rows if r.get("ctr")]
+        total_impressions = sum(int(r["impressions"]) for r in daily_agg)
+        total_clicks      = sum(int(r["clicks"]) for r in daily_agg)
+        total_conversions = round(sum(float(r["conversions"]) for r in daily_agg), 1)
+        ctr_vals          = [r["ctr"] for r in daily_agg if r["ctr"] > 0]
         total_ctr         = round(sum(ctr_vals) / len(ctr_vals), 2) if ctr_vals else 0.0
 
         # ── Funnel aggregated over the full date range (from DB) ───────────────
@@ -338,8 +385,8 @@ def get_brand_detail(
             cvr  = round(conv / clk * 100, 2) if clk > 0 else 0.0
             cpa  = round(sp / conv, 2)  if conv > 0 else None
             # Score: 0-100 based on ROAS vs target, CVR, spend efficiency
-            target_roas = float(brand.get("target_roas") or 3.0)
-            score = min(100, int((roas / target_roas) * 60 + min(cvr * 10, 40))) if roas > 0 else 0
+            target_roas_val = float(brand.get("target_roas") or 3.0)
+            score = min(100, int((roas / target_roas_val) * 60 + min(cvr * 10, 40))) if roas > 0 else 0
             scorecard.append({
                 "account_id":   aid,
                 "account_name": acct.get("account_name") or aid,
@@ -355,8 +402,6 @@ def get_brand_detail(
             })
 
         # ── Campaigns ─────────────────────────────────────────────────────────
-        # Step 1: fetch ALL known campaigns from the campaigns table — this is
-        # the source of truth for what exists today, independent of date range.
         all_camps_resp = (
             supabase.table("campaigns")
             .select("id, name, status, account_id")
@@ -365,7 +410,6 @@ def get_brand_detail(
         )
         all_camps = all_camps_resp.data or []
 
-        # Step 2: fetch metrics for those campaigns over the selected date range.
         campaign_ids_all = [c["id"] for c in all_camps]
         camp_agg: dict = defaultdict(lambda: {
             "campaign_name": "", "account_id": "",
@@ -374,7 +418,6 @@ def get_brand_detail(
             "ctr_sum": 0.0, "ctr_n": 0,
         })
 
-        # Earliest date each campaign ever appeared — used as created_at fallback
         first_seen: dict = {}
         if campaign_ids_all:
             earliest_resp = (
@@ -386,12 +429,11 @@ def get_brand_detail(
             )
             for r in (earliest_resp.data or []):
                 cid = r["campaign_id"]
-                d   = str(r["date"])[:10]
-                if cid not in first_seen or d < first_seen[cid]:
-                    first_seen[cid] = d
+                d_val = str(r["date"])[:10]
+                if cid not in first_seen or d_val < first_seen[cid]:
+                    first_seen[cid] = d_val
 
-        if campaign_ids_all:
-            camp_resp = (
+            camp_metrics_resp = (
                 supabase.table("campaign_daily_metrics")
                 .select("campaign_id, campaign_name, account_id, spend, revenue, conversions, impressions, clicks, ctr, atc, checkout")
                 .in_("campaign_id", campaign_ids_all)
@@ -399,7 +441,7 @@ def get_brand_detail(
                 .lte("date", date_to)
                 .execute()
             )
-            for r in (camp_resp.data or []):
+            for r in (camp_metrics_resp.data or []):
                 cid = r["campaign_id"]
                 camp_agg[cid]["campaign_name"] = r.get("campaign_name") or cid
                 camp_agg[cid]["account_id"]    = r.get("account_id", "")
@@ -410,40 +452,37 @@ def get_brand_detail(
                 camp_agg[cid]["clicks"]       += int(r.get("clicks") or 0)
                 camp_agg[cid]["atc"]          += float(r.get("atc") or 0)
                 camp_agg[cid]["checkout"]     += float(r.get("checkout") or 0)
-                ctr = float(r.get("ctr") or 0)
-                if ctr > 0:
-                    camp_agg[cid]["ctr_sum"] += ctr
+                ctr_val = float(r.get("ctr") or 0)
+                if ctr_val > 0:
+                    camp_agg[cid]["ctr_sum"] += ctr_val
                     camp_agg[cid]["ctr_n"]   += 1
 
-        # Step 3: build result from the campaigns table — every campaign appears
-        # regardless of whether it had spend in the selected date range.
         campaigns = []
         for c in all_camps:
             cid = c["id"]
-            m   = camp_agg.get(cid, {})
-            sp  = round(float(m.get("spend", 0)), 2)
-            rev = round(float(m.get("revenue", 0)), 2)
-            clk = int(m.get("clicks", 0))
-            conv = round(float(m.get("conversions", 0)), 1)
+            cm   = camp_agg.get(cid, {})
+            sp_val  = round(float(cm.get("spend", 0)), 2)
+            rev_val = round(float(cm.get("revenue", 0)), 2)
+            clk_val = int(cm.get("clicks", 0))
+            conv_val = round(float(cm.get("conversions", 0)), 1)
             campaigns.append({
                 "campaign_id":   cid,
                 "status":        c.get("status", "UNKNOWN"),
-                "campaign_name": m.get("campaign_name") or c.get("name") or cid,
+                "campaign_name": cm.get("campaign_name") or c.get("name") or cid,
                 "account_id":    c.get("account_id", ""),
                 "created_at":    first_seen.get(cid),
-                "spend":         sp,
-                "revenue":       rev,
-                "roas":          round(rev / sp, 2) if sp > 0 else 0.0,
-                "conversions":   conv,
-                "impressions":   int(m.get("impressions", 0)),
-                "clicks":        clk,
-                "ctr":           round(m["ctr_sum"] / m["ctr_n"], 2) if m.get("ctr_n", 0) > 0 else 0.0,
-                "atc":           int(m.get("atc", 0)),
-                "checkout":      int(m.get("checkout", 0)),
-                "cvr":           round(conv / clk * 100, 2) if clk > 0 else 0.0,
-                "cpa":           round(sp / conv, 2) if conv > 0 else None,
+                "spend":         sp_val,
+                "revenue":       rev_val,
+                "roas":          round(rev_val / sp_val, 2) if sp_val > 0 else 0.0,
+                "conversions":   conv_val,
+                "impressions":   int(cm.get("impressions", 0)),
+                "clicks":        clk_val,
+                "ctr":           round(cm["ctr_sum"] / cm["ctr_n"], 2) if cm.get("ctr_n", 0) > 0 else 0.0,
+                "atc":           int(cm.get("atc", 0)),
+                "checkout":      int(cm.get("checkout", 0)),
+                "cvr":           round(conv_val / clk_val * 100, 2) if clk_val > 0 else 0.0,
+                "cpa":           round(sp_val / conv_val, 2) if conv_val > 0 else None,
             })
-        # Active (live) campaigns first, then by spend descending
         campaigns.sort(key=lambda x: (x["status"] != "ACTIVE", -x["spend"]))
 
         return {
@@ -474,6 +513,7 @@ def get_brand_detail(
             "campaigns": campaigns,
             "date_from": date_from,
             "date_to":   date_to,
+            "last_synced": latest_sync,
         }
     except HTTPException:
         raise
@@ -695,22 +735,6 @@ def get_campaign_adsets(
             if datetime.now(last_sync.tzinfo) - last_sync > timedelta(hours=6):
                 is_stale = True
 
-    if rows and not is_stale:
-        return agg_result["data"]
-
-    # 2. No DB data OR stale — find account_id for this campaign then trigger background sync
-    try:
-        camp_resp = (
-            supabase.table("campaign_daily_metrics")
-            .select("account_id")
-            .eq("campaign_id", campaign_id)
-            .limit(1)
-            .execute()
-        )
-        account_id = camp_resp.data[0]["account_id"] if camp_resp.data else ""
-    except Exception:
-        account_id = ""
-
     if account_id and background_tasks is not None:
         from app.services.ingest import IngestService
         background_tasks.add_task(
@@ -719,7 +743,7 @@ def get_campaign_adsets(
         )
 
     # Return whatever we have (or empty) while sync runs in background
-    return agg_result["data"]
+    return {"data": agg_result["data"], "last_synced": agg_result["last_synced"]}
 
 
 @router.post("/{brand_id}/campaigns/{campaign_id}/adsets/sync")
@@ -799,9 +823,6 @@ def get_adset_ads(
             last_sync = datetime.fromisoformat(agg_result["last_synced"].replace("Z", "+00:00"))
             if datetime.now(last_sync.tzinfo) - last_sync > timedelta(hours=6):
                 is_stale = True
-
-    if rows and not missing_creatives and not is_stale:
-        return agg_result["data"]
 
     # No rows OR rows have no creatives OR stale — find parent IDs
     try:
