@@ -236,6 +236,7 @@ def get_brand_detail(
     brand_id: str,
     date_from: Optional[str] = Query(default=None),
     date_to: Optional[str] = Query(default=None),
+    background_tasks: BackgroundTasks = None,
 ) -> Any:
     """
     Full brand detail: today's KPIs, conversion funnel, 7-day daily breakdown,
@@ -311,13 +312,15 @@ def get_brand_detail(
         # If data is missing OR stale, trigger background sync
         if (not daily_rows or is_stale) and background_tasks is not None:
             from app.services.ingest import IngestService
-            # Logic for multi-account brand sync
             for acct in accounts:
                 clean_id = acct["account_id"].replace("act_", "")
-                # Force sync if stale (skip_existing=False)
                 background_tasks.add_task(
                     IngestService.sync_daily_metrics,
-                    clean_id, date_from, date_to, False if is_stale else True
+                    clean_id, date_from, date_to, None, not is_stale,
+                )
+                background_tasks.add_task(
+                    IngestService.sync_campaign_daily_metrics,
+                    clean_id, date_from, date_to, None, not is_stale,
                 )
 
         daily_agg_dict: dict = {}
@@ -732,13 +735,6 @@ def get_campaign_adsets(
             last_sync = datetime.fromisoformat(agg_result["last_synced"].replace("Z", "+00:00"))
             if datetime.now(last_sync.tzinfo) - last_sync > timedelta(hours=6):
                 is_stale = True
-
-    if account_id and background_tasks is not None:
-        from app.services.ingest import IngestService
-        background_tasks.add_task(
-            IngestService.sync_adset_daily_metrics,
-            campaign_id, account_id, date_from, date_to, False if is_stale else True,
-        )
 
     # Return whatever we have (or empty) while sync runs in background
     return {"data": agg_result["data"], "last_synced": agg_result["last_synced"]}
