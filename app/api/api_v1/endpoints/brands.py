@@ -245,11 +245,8 @@ def get_brand_detail(
     from app.api.api_v1.endpoints.analytics import _default_dates
     from collections import defaultdict
 
-    today = datetime.now().strftime("%Y-%m-%d")
     if not date_from or not date_to:
         date_from, date_to = _default_dates()
-
-    from datetime import datetime, timedelta
 
     try:
         brand = (
@@ -271,10 +268,6 @@ def get_brand_detail(
         ).data or []
         account_ids = [a["account_id"].replace("act_", "") for a in accounts]
 
-        if not date_from or not date_to:
-            from app.api.api_v1.endpoints.analytics import _default_dates
-            date_from, date_to = _default_dates()
-
         if not account_ids:
             return {
                 "brand": brand, "summary": {}, "daily": [], 
@@ -286,7 +279,7 @@ def get_brand_detail(
         # Include synced_at to check for staleness
         daily_resp = (
             supabase.table("daily_metrics")
-            .select("date, spend, revenue, impressions, clicks, conversions, ctr_sum, ctr_n, account_id, synced_at")
+            .select("date, spend, revenue, impressions, clicks, conversions, ctr, account_id, synced_at")
             .in_("account_id", list(account_ids))
             .gte("date", date_from)
             .lte("date", date_to)
@@ -334,8 +327,10 @@ def get_brand_detail(
             daily_agg_dict[date]["impressions"] += int(row["impressions"] or 0)
             daily_agg_dict[date]["clicks"]      += int(row["clicks"] or 0)
             daily_agg_dict[date]["conversions"] += float(row["conversions"] or 0)
-            daily_agg_dict[date]["ctr_sum"]     += float(row["ctr_sum"] or 0)
-            daily_agg_dict[date]["ctr_n"]       += int(row["ctr_n"] or 0)
+            ctr_val = float(row["ctr"] or 0)
+            if ctr_val > 0:
+                daily_agg_dict[date]["ctr_sum"] += ctr_val
+                daily_agg_dict[date]["ctr_n"]   += 1
 
         daily_agg = []
         for date in sorted(daily_agg_dict.keys()):
