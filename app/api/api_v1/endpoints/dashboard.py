@@ -14,14 +14,22 @@ def get_dashboard_summary(
 ) -> Any:
     """
     Consolidated performance summary for the selected date range.
-    Pulls from Meta Insights API when token is configured; falls back to Supabase.
+    Reads from local daily_metrics first; falls back to Meta API only if empty.
     """
     try:
-        from app.api.api_v1.endpoints.analytics import _fetch_daily_from_meta, _default_dates
+        from app.api.api_v1.endpoints.analytics import (
+            _read_daily_metrics, _aggregate_daily, _fetch_daily_from_meta, _default_dates
+        )
         if not date_from or not date_to:
             date_from, date_to = _default_dates()
 
-        daily = _fetch_daily_from_meta(date_from, date_to)
+        # 1. Local Supabase store — fast path
+        rows = _read_daily_metrics(date_from, date_to)
+        if rows:
+            daily = _aggregate_daily(rows)
+        else:
+            # 2. Live Meta API fallback (also writes to daily_metrics for next time)
+            daily = _fetch_daily_from_meta(date_from, date_to)
 
         if daily:
             total_spend = round(sum(r["spend"] for r in daily), 2)
@@ -36,7 +44,6 @@ def get_dashboard_summary(
             total_conversions = sum(float(m.get("conversions") or 0) for m in metrics)
             roas = round(total_revenue / total_spend, 2) if total_spend > 0 else 0
 
-        # Rule engine runs on mock entities until real EntityContext is built from Meta sync
         entities = get_mock_meta_entities()
         suggestions = executor.process_entities(entities)
 
