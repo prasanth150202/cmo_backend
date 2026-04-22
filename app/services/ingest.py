@@ -414,6 +414,29 @@ class IngestService:
         }
 
     @staticmethod
+    def sync_recent_all(
+        account_ids: List[str],
+        date_from: str,
+        date_to: str,
+    ) -> None:
+        """
+        Pull the last N days for all accounts sequentially.
+        Runs as a single background task to avoid concurrent socket exhaustion.
+        """
+        for account_id in account_ids:
+            try:
+                IngestService.sync_daily_metrics(account_id, date_from, date_to, None, False)
+            except Exception as e:
+                print(f"[sync-recent] daily failed for {account_id}: {e}")
+            time.sleep(1)
+            try:
+                IngestService.sync_campaign_daily_metrics(account_id, date_from, date_to, None, False)
+            except Exception as e:
+                print(f"[sync-recent] campaign failed for {account_id}: {e}")
+            # Gap between accounts to stay within Meta rate limits
+            time.sleep(2)
+
+    @staticmethod
     def sync_all_accounts_daily(date_from: str, date_to: str) -> Dict[str, Any]:
         """
         Sync daily_metrics for ALL mapped META accounts sequentially.

@@ -157,9 +157,8 @@ def sync_status() -> Any:
 @router.post("/sync-recent")
 def sync_recent(background_tasks: BackgroundTasks) -> Any:
     """
-    Kick off a background pull of the last 3 days for all META accounts.
-    Returns immediately — the actual sync runs after the response is sent.
-    Meta insights are delayed up to 48 h, so we always force re-pull (skip_existing=False).
+    Kick off a single serialized background task that pulls the last 3 days
+    for all META accounts one-at-a-time. Returns immediately.
     """
     from app.services.ingest import IngestService
     from datetime import datetime, timedelta
@@ -173,15 +172,11 @@ def sync_recent(background_tasks: BackgroundTasks) -> Any:
             if a.get("platform", "").upper() == "META"
         ]
 
-        for account_id in meta_accounts:
-            background_tasks.add_task(
-                IngestService.sync_daily_metrics,
-                account_id, date_from, date_to, None, False,
-            )
-            background_tasks.add_task(
-                IngestService.sync_campaign_daily_metrics,
-                account_id, date_from, date_to, None, False,
-            )
+        # Single task — runs all accounts sequentially to avoid socket exhaustion
+        background_tasks.add_task(
+            IngestService.sync_recent_all,
+            meta_accounts, date_from, date_to,
+        )
 
         return {
             "status": "started",
