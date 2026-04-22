@@ -1,5 +1,5 @@
 from typing import Any, List, Dict, Optional
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from app.db.supabase import supabase
 from app.services.mock_data import get_mock_meta_entities
 from app.services.rules.executor import executor
@@ -155,42 +155,39 @@ def sync_status() -> Any:
 
 
 @router.post("/sync-recent")
-def sync_recent() -> Any:
+def sync_recent(background_tasks: BackgroundTasks) -> Any:
     """
-    Pull the last 3 days from Meta and upsert into daily_metrics + campaign_daily_metrics.
-    Always force re-pulls (skip_existing=False) because Meta's insights data is delayed
-    up to 48h and retroactively updated — skipping existing rows would miss the corrections.
+    Kick off a background pull of the last 3 days for all META accounts.
+    Returns immediately — the actual sync runs after the response is sent.
+    Meta insights are delayed up to 48 h, so we always force re-pull (skip_existing=False).
     """
     from app.services.ingest import IngestService
     from datetime import datetime, timedelta
     try:
-        date_to = datetime.now().strftime("%Y-%m-%d")
+        date_to   = datetime.now().strftime("%Y-%m-%d")
         date_from = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
 
-        # Fetch all META accounts
         accts_resp = supabase.table("brand_accounts").select("account_id, platform").execute()
         meta_accounts = [
             a["account_id"] for a in (accts_resp.data or [])
             if a.get("platform", "").upper() == "META"
         ]
 
-        account_results = []
-        campaign_results = []
         for account_id in meta_accounts:
-            # Force re-pull account-level daily (skip_existing=False)
-            r1 = IngestService.sync_daily_metrics(account_id, date_from, date_to, skip_existing=False)
-            account_results.append(r1)
-            # Force re-pull campaign-level daily (skip_existing=False)
-            r2 = IngestService.sync_campaign_daily_metrics(account_id, date_from, date_to, skip_existing=False)
-            campaign_results.append(r2)
+            background_tasks.add_task(
+                IngestService.sync_daily_metrics,
+                account_id, date_from, date_to, None, False,
+            )
+            background_tasks.add_task(
+                IngestService.sync_campaign_daily_metrics,
+                account_id, date_from, date_to, None, False,
+            )
 
         return {
-            "status": "success",
+            "status": "started",
             "date_from": date_from,
             "date_to": date_to,
-            "accounts_synced": len(meta_accounts),
-            "account_rows_synced": sum(r.get("rows_synced", 0) for r in account_results),
-            "campaign_rows_synced": sum(r.get("rows_synced", 0) for r in campaign_results),
+            "accounts_queued": len(meta_accounts),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
