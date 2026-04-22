@@ -76,6 +76,8 @@ def _pull_chunk(account_id: str, date_from: str, date_to: str) -> int:
                 },
             )
             rows_upserted = 0
+            batch = []
+            synced_at = datetime.utcnow().isoformat()
             for row in insights:
                 d = row.export_all_data()
                 date = d.get("date_start", "")
@@ -89,30 +91,24 @@ def _pull_chunk(account_id: str, date_from: str, date_to: str) -> int:
                 atc         = _extract_action(actions,     "add_to_cart")
                 atc_value   = _extract_action(action_vals, "add_to_cart")
                 checkout    = _extract_action(actions,     "initiate_checkout")
-                impressions = int(d.get("impressions", 0) or 0)
-                clicks      = int(d.get("clicks", 0) or 0)
-                ctr         = float(d.get("ctr", 0) or 0)
-                roas        = round(revenue / spend, 2) if spend > 0 else 0.0
-
-                supabase.table("daily_metrics").upsert(
-                    {
-                        "date":        date,
-                        "account_id":  clean_id,
-                        "spend":       round(spend, 2),
-                        "revenue":     round(revenue, 2),
-                        "roas":        roas,
-                        "conversions": round(conversions, 1),
-                        "impressions": impressions,
-                        "clicks":      clicks,
-                        "ctr":         round(ctr, 2),
-                        "atc":         round(atc, 1),
-                        "atc_value":   round(atc_value, 2),
-                        "checkout":    round(checkout, 1),
-                        "synced_at":   datetime.utcnow().isoformat(),
-                    },
-                    on_conflict="date,account_id",
-                ).execute()
-                rows_upserted += 1
+                batch.append({
+                    "date":        date,
+                    "account_id":  clean_id,
+                    "spend":       round(spend, 2),
+                    "revenue":     round(revenue, 2),
+                    "roas":        round(revenue / spend, 2) if spend > 0 else 0.0,
+                    "conversions": round(conversions, 1),
+                    "impressions": int(d.get("impressions", 0) or 0),
+                    "clicks":      int(d.get("clicks", 0) or 0),
+                    "ctr":         round(float(d.get("ctr", 0) or 0), 2),
+                    "atc":         round(atc, 1),
+                    "atc_value":   round(atc_value, 2),
+                    "checkout":    round(checkout, 1),
+                    "synced_at":   synced_at,
+                })
+            if batch:
+                supabase.table("daily_metrics").upsert(batch, on_conflict="date,account_id").execute()
+                rows_upserted = len(batch)
             return rows_upserted
 
         except Exception as e:
@@ -172,13 +168,14 @@ def _pull_campaign_chunk(account_id: str, date_from: str, date_to: str) -> int:
                 },
             )
             rows_upserted = 0
+            batch = []
+            synced_at = datetime.utcnow().isoformat()
             for row in insights:
                 d = row.export_all_data()
                 date        = d.get("date_start", "")
                 campaign_id = d.get("campaign_id", "")
                 if not date or not campaign_id:
                     continue
-
                 actions     = d.get("actions")
                 action_vals = d.get("action_values")
                 spend       = float(d.get("spend", 0) or 0)
@@ -187,32 +184,26 @@ def _pull_campaign_chunk(account_id: str, date_from: str, date_to: str) -> int:
                 atc         = _extract_action(actions,     "add_to_cart")
                 atc_value   = _extract_action(action_vals, "add_to_cart")
                 checkout    = _extract_action(actions,     "initiate_checkout")
-                impressions = int(d.get("impressions", 0) or 0)
-                clicks      = int(d.get("clicks", 0) or 0)
-                ctr         = float(d.get("ctr", 0) or 0)
-                roas        = round(revenue / spend, 2) if spend > 0 else 0.0
-
-                supabase.table("campaign_daily_metrics").upsert(
-                    {
-                        "date":          date,
-                        "campaign_id":   campaign_id,
-                        "campaign_name": d.get("campaign_name", ""),
-                        "account_id":    clean_id,
-                        "spend":         round(spend, 2),
-                        "revenue":       round(revenue, 2),
-                        "roas":          roas,
-                        "conversions":   round(conversions, 1),
-                        "impressions":   impressions,
-                        "clicks":        clicks,
-                        "ctr":           round(ctr, 2),
-                        "atc":           round(atc, 1),
-                        "atc_value":     round(atc_value, 2),
-                        "checkout":      round(checkout, 1),
-                        "synced_at":     datetime.utcnow().isoformat(),
-                    },
-                    on_conflict="date,campaign_id",
-                ).execute()
-                rows_upserted += 1
+                batch.append({
+                    "date":          date,
+                    "campaign_id":   campaign_id,
+                    "campaign_name": d.get("campaign_name", ""),
+                    "account_id":    clean_id,
+                    "spend":         round(spend, 2),
+                    "revenue":       round(revenue, 2),
+                    "roas":          round(revenue / spend, 2) if spend > 0 else 0.0,
+                    "conversions":   round(conversions, 1),
+                    "impressions":   int(d.get("impressions", 0) or 0),
+                    "clicks":        int(d.get("clicks", 0) or 0),
+                    "ctr":           round(float(d.get("ctr", 0) or 0), 2),
+                    "atc":           round(atc, 1),
+                    "atc_value":     round(atc_value, 2),
+                    "checkout":      round(checkout, 1),
+                    "synced_at":     synced_at,
+                })
+            if batch:
+                supabase.table("campaign_daily_metrics").upsert(batch, on_conflict="date,campaign_id").execute()
+                rows_upserted = len(batch)
             return rows_upserted
 
         except Exception as e:
@@ -521,11 +512,13 @@ class IngestService:
                             "limit": 500,
                         },
                     )
+                    adset_batch = []
+                    synced_at = datetime.utcnow().isoformat()
                     for row in insights:
                         d = row.export_all_data()
-                        date    = d.get("date_start", "")
-                        adset_id = d.get("adset_id", "")
-                        if not date or not adset_id:
+                        date     = d.get("date_start", "")
+                        adset_id_r = d.get("adset_id", "")
+                        if not date or not adset_id_r:
                             continue
                         actions     = d.get("actions")
                         action_vals = d.get("action_values")
@@ -535,33 +528,27 @@ class IngestService:
                         atc         = _extract_action(actions,     "add_to_cart")
                         atc_value   = _extract_action(action_vals, "add_to_cart")
                         checkout    = _extract_action(actions,     "initiate_checkout")
-                        impressions = int(d.get("impressions", 0) or 0)
-                        clicks      = int(d.get("clicks", 0) or 0)
-                        ctr         = float(d.get("ctr", 0) or 0)
-                        roas        = round(revenue / spend, 2) if spend > 0 else 0.0
-
-                        supabase.table("adset_daily_metrics").upsert(
-                            {
-                                "date":         date,
-                                "adset_id":     adset_id,
-                                "adset_name":   d.get("adset_name", ""),
-                                "campaign_id":  campaign_id,
-                                "account_id":   clean_account,
-                                "spend":        round(spend, 2),
-                                "revenue":      round(revenue, 2),
-                                "roas":         roas,
-                                "conversions":  round(conversions, 1),
-                                "impressions":  impressions,
-                                "clicks":       clicks,
-                                "ctr":          round(ctr, 2),
-                                "atc":          round(atc, 1),
-                                "atc_value":    round(atc_value, 2),
-                                "checkout":     round(checkout, 1),
-                                "synced_at":    datetime.utcnow().isoformat(),
-                            },
-                            on_conflict="date,adset_id",
-                        ).execute()
-                        total_rows += 1
+                        adset_batch.append({
+                            "date":         date,
+                            "adset_id":     adset_id_r,
+                            "adset_name":   d.get("adset_name", ""),
+                            "campaign_id":  campaign_id,
+                            "account_id":   clean_account,
+                            "spend":        round(spend, 2),
+                            "revenue":      round(revenue, 2),
+                            "roas":         round(revenue / spend, 2) if spend > 0 else 0.0,
+                            "conversions":  round(conversions, 1),
+                            "impressions":  int(d.get("impressions", 0) or 0),
+                            "clicks":       int(d.get("clicks", 0) or 0),
+                            "ctr":          round(float(d.get("ctr", 0) or 0), 2),
+                            "atc":          round(atc, 1),
+                            "atc_value":    round(atc_value, 2),
+                            "checkout":     round(checkout, 1),
+                            "synced_at":    synced_at,
+                        })
+                    if adset_batch:
+                        supabase.table("adset_daily_metrics").upsert(adset_batch, on_conflict="date,adset_id").execute()
+                        total_rows += len(adset_batch)
                     break
                 except Exception as e:
                     err = str(e)
@@ -860,10 +847,11 @@ class IngestService:
         # Batch-fetch creatives + status for all ads in one API call
         ads_meta = IngestService._fetch_ads_metadata(adset_id)
 
-        # Upsert all rows with creative + status data merged in
+        # Build all rows then upsert in one batch call
+        batch = []
+        synced_at = datetime.utcnow().isoformat()
         for d in all_insight_rows:
-            date  = d.get("date_start", "")
-            ad_id = d.get("ad_id", "")
+            ad_id       = d.get("ad_id", "")
             actions     = d.get("actions")
             action_vals = d.get("action_values")
             spend       = float(d.get("spend", 0) or 0)
@@ -872,43 +860,37 @@ class IngestService:
             atc         = _extract_action(actions,     "add_to_cart")
             atc_value   = _extract_action(action_vals, "add_to_cart")
             checkout    = _extract_action(actions,     "initiate_checkout")
-            impressions = int(d.get("impressions", 0) or 0)
-            clicks      = int(d.get("clicks", 0) or 0)
-            ctr         = float(d.get("ctr", 0) or 0)
-            roas        = round(revenue / spend, 2) if spend > 0 else 0.0
             meta        = ads_meta.get(ad_id, {})
-
-            supabase.table("ad_daily_metrics").upsert(
-                {
-                    "date":            date,
-                    "ad_id":           ad_id,
-                    "ad_name":         d.get("ad_name", ""),
-                    "adset_id":        adset_id,
-                    "campaign_id":     campaign_id,
-                    "account_id":      clean_account,
-                    "spend":           round(spend, 2),
-                    "revenue":         round(revenue, 2),
-                    "roas":            roas,
-                    "conversions":     round(conversions, 1),
-                    "impressions":     impressions,
-                    "clicks":          clicks,
-                    "ctr":             round(ctr, 2),
-                    "atc":             round(atc, 1),
-                    "atc_value":       round(atc_value, 2),
-                    "checkout":        round(checkout, 1),
-                    "ad_title":        meta.get("ad_title", ""),
-                    "ad_body":         meta.get("ad_body", ""),
-                    "creative_type":   meta.get("creative_type", ""),
-                    "thumbnail_url":   meta.get("thumbnail_url", ""),
-                    "image_url":       meta.get("image_url", ""),
-                    "call_to_action":  meta.get("call_to_action", ""),
-                    "destination_url": meta.get("destination_url", ""),
-                    "ad_status":       meta.get("ad_status", "UNKNOWN"),
-                    "synced_at":       datetime.utcnow().isoformat(),
-                },
-                on_conflict="date,ad_id",
-            ).execute()
-            total_rows += 1
+            batch.append({
+                "date":            d.get("date_start", ""),
+                "ad_id":           ad_id,
+                "ad_name":         d.get("ad_name", ""),
+                "adset_id":        adset_id,
+                "campaign_id":     campaign_id,
+                "account_id":      clean_account,
+                "spend":           round(spend, 2),
+                "revenue":         round(revenue, 2),
+                "roas":            round(revenue / spend, 2) if spend > 0 else 0.0,
+                "conversions":     round(conversions, 1),
+                "impressions":     int(d.get("impressions", 0) or 0),
+                "clicks":          int(d.get("clicks", 0) or 0),
+                "ctr":             round(float(d.get("ctr", 0) or 0), 2),
+                "atc":             round(atc, 1),
+                "atc_value":       round(atc_value, 2),
+                "checkout":        round(checkout, 1),
+                "ad_title":        meta.get("ad_title", ""),
+                "ad_body":         meta.get("ad_body", ""),
+                "creative_type":   meta.get("creative_type", ""),
+                "thumbnail_url":   meta.get("thumbnail_url", ""),
+                "image_url":       meta.get("image_url", ""),
+                "call_to_action":  meta.get("call_to_action", ""),
+                "destination_url": meta.get("destination_url", ""),
+                "ad_status":       meta.get("ad_status", "UNKNOWN"),
+                "synced_at":       synced_at,
+            })
+        if batch:
+            supabase.table("ad_daily_metrics").upsert(batch, on_conflict="date,ad_id").execute()
+            total_rows = len(batch)
 
         return {"adset_id": adset_id, "date_from": date_from, "date_to": date_to, "rows_synced": total_rows}
 
