@@ -86,16 +86,60 @@ class MetaService:
             ctr=round(ctr, 2),
         )
 
+        # Derive shorter windows from Supabase campaign_daily_metrics to avoid extra API calls
+        campaign_id = meta_data.get("campaign_id", meta_data.get("id", ""))
+        account_id  = meta_data.get("account_id", "")
+        m1d = m3d = m14d = m30d = m7d
+        if campaign_id:
+            try:
+                from app.db.supabase import supabase as _sb
+                from datetime import datetime, timedelta
+                today_str = datetime.now().strftime("%Y-%m-%d")
+
+                def _window(days: int) -> AdMetrics:
+                    since = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+                    resp  = (
+                        _sb.table("campaign_daily_metrics")
+                        .select("spend, revenue, conversions, impressions, clicks, ctr")
+                        .eq("campaign_id", campaign_id)
+                        .gte("date", since)
+                        .lte("date", today_str)
+                        .execute()
+                    )
+                    rows = resp.data or []
+                    if not rows:
+                        return m7d
+                    sp  = sum(float(r.get("spend") or 0) for r in rows)
+                    rev = sum(float(r.get("revenue") or 0) for r in rows)
+                    conv = sum(float(r.get("conversions") or 0) for r in rows)
+                    ctrs = [float(r.get("ctr") or 0) for r in rows if r.get("ctr")]
+                    return AdMetrics(
+                        spend=round(sp, 2),
+                        revenue=round(rev, 2),
+                        roas=round(rev / sp, 2) if sp > 0 else 0.0,
+                        conversions=round(conv, 1),
+                        impressions=sum(int(r.get("impressions") or 0) for r in rows),
+                        clicks=sum(int(r.get("clicks") or 0) for r in rows),
+                        ctr=round(sum(ctrs) / len(ctrs), 2) if ctrs else 0.0,
+                    )
+
+                m1d  = _window(1)
+                m3d  = _window(3)
+                m14d = _window(14)
+                m30d = _window(30)
+            except Exception:
+                pass
+
         return EntityContext(
-            entity_id=meta_data.get("campaign_id", meta_data.get("id", "")),
+            entity_id=campaign_id,
             entity_name=meta_data.get("campaign_name", meta_data.get("name", "")),
-            account_id=meta_data.get("account_id", ""),
+            account_id=account_id,
             m7d=m7d,
-            m1d=m7d,
-            m3d=m7d,
-            m14d=m7d,
-            m30d=m7d,
-            today=m7d,
+            m1d=m1d,
+            m3d=m3d,
+            m14d=m14d,
+            m30d=m30d,
+            today=m1d,
             current_budget=0.0,
         )
 
