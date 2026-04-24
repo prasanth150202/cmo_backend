@@ -1,5 +1,5 @@
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from datetime import datetime, timedelta
 from collections import defaultdict
 import math
@@ -203,6 +203,7 @@ def _aggregate_ad_rows(rows: List[Dict]) -> Dict[str, Dict]:
         "ad_title": "", "ad_body": "", "creative_type": "",
         "thumbnail_url": "", "image_url": "", "call_to_action": "", "destination_url": "",
         "min_date": "",
+        "created_date": "",   # actual Meta created_time, populated from _fetch_ads_from_meta
     })
     for r in rows:
         aid = r["ad_id"]
@@ -223,14 +224,18 @@ def _aggregate_ad_rows(rows: List[Dict]) -> Dict[str, Dict]:
             val = r.get(field) or ""
             if val:
                 agg[aid][field] = val
-        # Track earliest date seen for this ad (proxy for creation/launch date)
+        # Track earliest date seen (proxy for launch date in this range)
         date_val = str(r.get("date") or "")[:10]
         if date_val and (not agg[aid]["min_date"] or date_val < agg[aid]["min_date"]):
             agg[aid]["min_date"] = date_val
+        # Carry through the actual Meta created_time when available (_created_date set by _fetch_ads_from_meta)
+        cd = r.get("_created_date") or ""
+        if cd and not agg[aid]["created_date"]:
+            agg[aid]["created_date"] = cd
     return agg
 
 
-def _build_creative(ad_id: str, m: Dict, campaign_status_map: Dict, campaign_names: Dict) -> Dict:
+def _build_creative(ad_id: str, m: Dict, campaign_status_map: Dict, campaign_names: Dict, date_from: str = "") -> Dict:
     sp  = round(m["spend"], 2)
     rev = round(m["revenue"], 2)
     imp = m["impressions"]
@@ -253,6 +258,7 @@ def _build_creative(ad_id: str, m: Dict, campaign_status_map: Dict, campaign_nam
         "ad_id":            ad_id,
         "ad_name":          m["ad_name"],
         "ad_status":        ad_status,
+        "adset_id":         m["adset_id"],
         "campaign_id":      campaign_id,
         "campaign_status":  campaign_status,
         "is_active":        is_active,
@@ -265,7 +271,12 @@ def _build_creative(ad_id: str, m: Dict, campaign_status_map: Dict, campaign_nam
         "call_to_action":   m["call_to_action"],
         "destination_url":  m["destination_url"],
         "campaign_name":    campaign_names.get(campaign_id, ""),
-        "first_seen_date":  m.get("min_date", ""),
+        # Use Meta created_time if available, else fall back to first seen in metrics
+        "first_seen_date":  m.get("created_date") or m.get("min_date", ""),
+        # True when the ad started running AFTER the date_from → genuinely new in this range
+        "is_new_in_range":  bool(
+            (m.get("created_date") or m.get("min_date", "")) > date_from
+        ) if date_from else False,
         "metrics": {
             "spend":       sp,
             "revenue":     rev,
@@ -326,15 +337,74 @@ def _apply_cached_score(c: Dict, s: Dict) -> None:
 
 # ── Meta API fallback ────────────────────────────────────────────────────────
 
+def _safe_d(obj) -> dict:
+    """Safely convert any Meta SDK object or dict to a plain dict."""
+    if obj is None:
+        return {}
+    if hasattr(obj, "export_all_data"):
+        return obj.export_all_data() or {}
+    if isinstance(obj, dict):
+        return obj
+    return {}
+
+
+def _extract_thumb(cr: dict) -> tuple[str, str]:
+    """
+    Return (thumbnail_url, image_url) from a creative dict.
+    Tries direct fields first, then object_story_spec sub-objects.
+    Mirrors the logic in IngestService._fetch_ads_metadata.
+    """
+    thumb = cr.get("thumbnail_url", "") or ""
+    img   = cr.get("image_url", "") or ""
+
+    oss = _safe_d(cr.get("object_story_spec"))
+    if oss:
+        # Link-share / SHARE
+        ld = _safe_d(oss.get("link_data"))
+        if ld:
+            thumb = thumb or ld.get("picture", "") or ld.get("image_url", "") or ""
+            img   = img   or ld.get("picture", "") or ld.get("image_url", "") or ""
+
+        # Video
+        vd = _safe_d(oss.get("video_data"))
+        if vd:
+            thumb = thumb or vd.get("thumbnail_url", "") or ""
+
+        # Carousel / template
+        td = _safe_d(oss.get("template_data") or oss.get("multi_share_data"))
+        if td:
+            for child in (td.get("child_attachments") or []):
+                cd = _safe_d(child)
+                thumb = thumb or cd.get("image_url", "") or cd.get("picture", "") or ""
+                img   = img   or cd.get("image_url", "") or cd.get("picture", "") or ""
+                if thumb:
+                    break
+
+    # Fall back: if only one is set, use it for both
+    thumb = thumb or img
+    img   = img   or thumb
+    return thumb, img
+
+
+def _creative_type_from_obj(obj_type: str) -> str:
+    t = (obj_type or "").upper()
+    if t in ("VIDEO", "VIDEO_INLINE"):       return "VIDEO"
+    if t in ("CAROUSEL", "TEMPLATE"):        return "CAROUSEL"
+    if t in ("PHOTO", "IMAGE"):              return "IMAGE"
+    if t in ("SHARE", "LINK", "LINK_SHARE"): return "LINK"
+    return t or "IMAGE"
+
+
 def _fetch_ads_from_meta(
     account_ids: List[str],
     date_from: str,
     date_to: str,
 ) -> List[Dict]:
     """
-    Pull ad-level daily insights from Meta API for all accounts.
-    Called when ad_daily_metrics has no data for the requested range.
-    Results are stored back into ad_daily_metrics for future fast reads.
+    Pull ad-level daily insights from Meta for all accounts when
+    ad_daily_metrics has no data for the requested range.
+    Also fetches creative details (thumbnail, type, title) and caches
+    everything back into ad_daily_metrics for fast future reads.
     """
     from facebook_business.api import FacebookAdsApi
     from facebook_business.adobjects.adaccount import AdAccount
@@ -346,23 +416,15 @@ def _fetch_ads_from_meta(
 
     FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN, api_version="v22.0")
 
-    def _creative_type(obj_type: str) -> str:
-        t = (obj_type or "").upper()
-        if t in ("VIDEO", "VIDEO_INLINE"):        return "VIDEO"
-        if t in ("CAROUSEL", "TEMPLATE"):         return "CAROUSEL"
-        if t in ("PHOTO", "IMAGE"):               return "IMAGE"
-        if t in ("SHARE", "LINK", "LINK_SHARE"):  return "LINK"
-        return t or "IMAGE"
-
     all_rows: List[Dict] = []
 
     for account_id in account_ids:
-        norm_id  = account_id if account_id.startswith("act_") else f"act_{account_id}"
-        clean_id = account_id.replace("act_", "")
+        norm_id   = account_id if account_id.startswith("act_") else f"act_{account_id}"
+        clean_id  = account_id.replace("act_", "")
         synced_at = datetime.utcnow().isoformat()
 
         try:
-            # ── 1. Ad-level daily performance metrics ──────────────────────
+            # ── 1. Ad-level daily performance (all ads, all statuses) ──────
             insights = AdAccount(norm_id).get_insights(
                 fields=[
                     "ad_id", "ad_name", "campaign_id", "adset_id",
@@ -374,15 +436,9 @@ def _fetch_ads_from_meta(
                     "time_range":     {"since": date_from, "until": date_to},
                     "time_increment": 1,
                     "limit":          500,
-                    "filtering": [{"field": "ad.effective_status", "operator": "IN",
-                                   "value": ["ACTIVE", "PAUSED", "CAMPAIGN_PAUSED",
-                                             "ADSET_PAUSED", "PENDING_REVIEW",
-                                             "DISAPPROVED", "PREAPPROVED",
-                                             "PENDING_BILLING_INFO", "ARCHIVED"]}],
                 },
             )
 
-            # Collect rows + track which ad_ids appeared
             ad_ids_seen: set = set()
             insight_rows: List[Dict] = []
             for row in insights:
@@ -422,13 +478,13 @@ def _fetch_ads_from_meta(
                     "synced_at": synced_at,
                 })
 
-            # ── 2. Creative details for all ads in this account ────────────
+            # ── 2. Creative details + created_time for all ads ─────────────
             ad_meta: Dict[str, Dict] = {}
-            if ad_ids_seen:
+            if insight_rows:
                 try:
                     ads_resp = AdAccount(norm_id).get_ads(
                         fields=[
-                            "id", "name", "effective_status",
+                            "id", "name", "effective_status", "created_time",
                             "creative{title,body,object_type,"
                             "thumbnail_url,image_url,"
                             "call_to_action_type,link_url,"
@@ -437,40 +493,26 @@ def _fetch_ads_from_meta(
                         params={"limit": 500},
                     )
                     for ad in ads_resp:
-                        ad_d = ad.export_all_data() if hasattr(ad, "export_all_data") else dict(ad)
+                        ad_d = _safe_d(ad)
                         aid  = ad_d.get("id", "")
                         if not aid:
                             continue
-                        cr = ad_d.get("creative") or {}
-                        if hasattr(cr, "export_all_data"):
-                            cr = cr.export_all_data() or {}
-
-                        # Extract thumbnail from object_story_spec if direct field empty
-                        thumb = cr.get("thumbnail_url", "")
-                        img   = cr.get("image_url", "")
-                        oss   = cr.get("object_story_spec") or {}
-                        if hasattr(oss, "export_all_data"):
-                            oss = oss.export_all_data() or {}
-                        if not thumb and not img:
-                            ld = oss.get("link_data") or {}
-                            if hasattr(ld, "export_all_data"):
-                                ld = ld.export_all_data() or {}
-                            thumb = ld.get("picture", "") or ld.get("image_url", "")
-                            vd = oss.get("video_data") or {}
-                            if hasattr(vd, "export_all_data"):
-                                vd = vd.export_all_data() or {}
-                            if not thumb:
-                                thumb = vd.get("thumbnail_url", "")
+                        cr            = _safe_d(ad_d.get("creative"))
+                        thumb, img    = _extract_thumb(cr)
+                        created_time  = ad_d.get("created_time", "")
+                        # Normalise created_time to YYYY-MM-DD
+                        created_date  = str(created_time)[:10] if created_time else ""
 
                         ad_meta[aid] = {
                             "ad_title":       cr.get("title", "") or ad_d.get("name", ""),
                             "ad_body":        cr.get("body", ""),
-                            "creative_type":  _creative_type(cr.get("object_type", "")),
+                            "creative_type":  _creative_type_from_obj(cr.get("object_type", "")),
                             "thumbnail_url":  thumb,
                             "image_url":      img,
                             "call_to_action": cr.get("call_to_action_type", ""),
                             "destination_url": cr.get("link_url", ""),
                             "ad_status":      ad_d.get("effective_status", "UNKNOWN"),
+                            "created_date":   created_date,
                         }
                 except Exception as e:
                     print(f"[creative] get_ads error for {clean_id}: {e}")
@@ -480,16 +522,20 @@ def _fetch_ads_from_meta(
                 meta = ad_meta.get(r["ad_id"])
                 if meta:
                     for k, v in meta.items():
-                        if v:  # only overwrite if non-empty
+                        if k == "created_date":
+                            # Store actual creation date for the analysis layer to use
+                            r["_created_date"] = v
+                        elif v:
                             r[k] = v
 
-            # ── 3. Cache to ad_daily_metrics ──────────────────────────────
+            # ── 3. Cache performance + creative data to ad_daily_metrics ───
             if insight_rows:
+                # Strip the _created_date helper field before DB insert
+                db_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in insight_rows]
                 try:
-                    # Upsert in chunks of 200 to avoid payload limits
-                    for i in range(0, len(insight_rows), 200):
+                    for i in range(0, len(db_rows), 200):
                         supabase.table("ad_daily_metrics").upsert(
-                            insight_rows[i:i + 200],
+                            db_rows[i:i + 200],
                             on_conflict="date,ad_id",
                         ).execute()
                 except Exception as e:
@@ -507,6 +553,7 @@ def _fetch_ads_from_meta(
 
 @router.get("/analysis")
 def get_creative_analysis(
+    background_tasks: BackgroundTasks,
     brand_id:         str           = Query(...),
     date_from:        Optional[str] = Query(default=None),
     date_to:          Optional[str] = Query(default=None),
@@ -588,13 +635,25 @@ def get_creative_analysis(
 
         # 5. Build creative objects; exclude zero-spend
         all_creatives = [
-            _build_creative(ad_id, m, campaign_status_map, campaign_names)
+            _build_creative(ad_id, m, campaign_status_map, campaign_names, date_from)
             for ad_id, m in agg.items()
             if m["spend"] > 0
         ]
 
         if not all_creatives:
             return {"creatives": [], "summary": {}, "date_from": date_from, "date_to": date_to}
+
+        # 5b. Trigger background thumbnail backfill for any ads missing creative data
+        missing_thumb_ads = [
+            c for c in all_creatives
+            if not c.get("thumbnail_url") and not c.get("image_url")
+        ]
+        missing_thumb_adsets = {c["adset_id"] for c in missing_thumb_ads if c.get("adset_id")}
+        if missing_thumb_adsets:
+            from app.services.ingest import IngestService
+            for adset_id in list(missing_thumb_adsets)[:10]:   # cap at 10 per request
+                background_tasks.add_task(IngestService.backfill_ad_creatives, adset_id)
+        missing_thumbnails_count = len(missing_thumb_ads)
 
         # 6. Load cached scores (skip if force_reanalyze)
         cached: Dict[str, Dict] = {}
@@ -670,12 +729,13 @@ def get_creative_analysis(
         }
 
         return {
-            "creatives":        all_creatives,
-            "summary":          summary,
-            "date_from":        date_from,
-            "date_to":          date_to,
-            "brand_id":         brand_id,
-            "synced_from_meta": synced_from_meta,
+            "creatives":               all_creatives,
+            "summary":                 summary,
+            "date_from":               date_from,
+            "date_to":                 date_to,
+            "brand_id":                brand_id,
+            "synced_from_meta":        synced_from_meta,
+            "missing_thumbnails_count": missing_thumbnails_count,
         }
 
     except Exception as e:
