@@ -37,9 +37,10 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: str = ""
     GOOGLE_REFRESH_TOKEN: str = ""
 
-    # OpenAI / Gemini Configuration
+    # OpenAI / Gemini / Anthropic Configuration
     OPENAI_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
+    ANTHROPIC_API_KEY: str = ""
 
     class Config:
         case_sensitive = True
