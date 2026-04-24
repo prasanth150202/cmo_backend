@@ -202,6 +202,7 @@ def _aggregate_ad_rows(rows: List[Dict]) -> Dict[str, Dict]:
         "ad_name": "", "ad_status": "", "adset_id": "", "campaign_id": "", "account_id": "",
         "ad_title": "", "ad_body": "", "creative_type": "",
         "thumbnail_url": "", "image_url": "", "call_to_action": "", "destination_url": "",
+        "min_date": "",
     })
     for r in rows:
         aid = r["ad_id"]
@@ -222,10 +223,14 @@ def _aggregate_ad_rows(rows: List[Dict]) -> Dict[str, Dict]:
             val = r.get(field) or ""
             if val:
                 agg[aid][field] = val
+        # Track earliest date seen for this ad (proxy for creation/launch date)
+        date_val = str(r.get("date") or "")[:10]
+        if date_val and (not agg[aid]["min_date"] or date_val < agg[aid]["min_date"]):
+            agg[aid]["min_date"] = date_val
     return agg
 
 
-def _build_creative(ad_id: str, m: Dict, campaign_status_map: Dict) -> Dict:
+def _build_creative(ad_id: str, m: Dict, campaign_status_map: Dict, campaign_names: Dict) -> Dict:
     sp  = round(m["spend"], 2)
     rev = round(m["revenue"], 2)
     imp = m["impressions"]
@@ -259,6 +264,8 @@ def _build_creative(ad_id: str, m: Dict, campaign_status_map: Dict) -> Dict:
         "ad_body":          m["ad_body"],
         "call_to_action":   m["call_to_action"],
         "destination_url":  m["destination_url"],
+        "campaign_name":    campaign_names.get(campaign_id, ""),
+        "first_seen_date":  m.get("min_date", ""),
         "metrics": {
             "spend":       sp,
             "revenue":     rev,
@@ -317,6 +324,185 @@ def _apply_cached_score(c: Dict, s: Dict) -> None:
     c["ai_reasoning"]      = s.get("ai_reasoning")  or ""
 
 
+# ── Meta API fallback ────────────────────────────────────────────────────────
+
+def _fetch_ads_from_meta(
+    account_ids: List[str],
+    date_from: str,
+    date_to: str,
+) -> List[Dict]:
+    """
+    Pull ad-level daily insights from Meta API for all accounts.
+    Called when ad_daily_metrics has no data for the requested range.
+    Results are stored back into ad_daily_metrics for future fast reads.
+    """
+    from facebook_business.api import FacebookAdsApi
+    from facebook_business.adobjects.adaccount import AdAccount
+    from app.services.meta import _extract_action
+    from app.core.config import settings
+
+    if not settings.META_SYSTEM_USER_TOKEN:
+        return []
+
+    FacebookAdsApi.init(access_token=settings.META_SYSTEM_USER_TOKEN, api_version="v22.0")
+
+    def _creative_type(obj_type: str) -> str:
+        t = (obj_type or "").upper()
+        if t in ("VIDEO", "VIDEO_INLINE"):        return "VIDEO"
+        if t in ("CAROUSEL", "TEMPLATE"):         return "CAROUSEL"
+        if t in ("PHOTO", "IMAGE"):               return "IMAGE"
+        if t in ("SHARE", "LINK", "LINK_SHARE"):  return "LINK"
+        return t or "IMAGE"
+
+    all_rows: List[Dict] = []
+
+    for account_id in account_ids:
+        norm_id  = account_id if account_id.startswith("act_") else f"act_{account_id}"
+        clean_id = account_id.replace("act_", "")
+        synced_at = datetime.utcnow().isoformat()
+
+        try:
+            # ── 1. Ad-level daily performance metrics ──────────────────────
+            insights = AdAccount(norm_id).get_insights(
+                fields=[
+                    "ad_id", "ad_name", "campaign_id", "adset_id",
+                    "spend", "impressions", "clicks", "ctr",
+                    "actions", "action_values",
+                ],
+                params={
+                    "level":          "ad",
+                    "time_range":     {"since": date_from, "until": date_to},
+                    "time_increment": 1,
+                    "limit":          500,
+                    "filtering": [{"field": "ad.effective_status", "operator": "IN",
+                                   "value": ["ACTIVE", "PAUSED", "CAMPAIGN_PAUSED",
+                                             "ADSET_PAUSED", "PENDING_REVIEW",
+                                             "DISAPPROVED", "PREAPPROVED",
+                                             "PENDING_BILLING_INFO", "ARCHIVED"]}],
+                },
+            )
+
+            # Collect rows + track which ad_ids appeared
+            ad_ids_seen: set = set()
+            insight_rows: List[Dict] = []
+            for row in insights:
+                d     = row.export_all_data()
+                ad_id = d.get("ad_id", "")
+                date  = d.get("date_start", "")
+                if not ad_id or not date:
+                    continue
+                ad_ids_seen.add(ad_id)
+                spend       = float(d.get("spend", 0) or 0)
+                revenue     = _extract_action(d.get("action_values"), "omni_purchase")
+                conversions = _extract_action(d.get("actions"),       "omni_purchase")
+                atc         = _extract_action(d.get("actions"),       "add_to_cart")
+                atc_value   = _extract_action(d.get("action_values"), "add_to_cart")
+                checkout    = _extract_action(d.get("actions"),       "initiate_checkout")
+                insight_rows.append({
+                    "date":            date,
+                    "ad_id":           ad_id,
+                    "ad_name":         d.get("ad_name", ""),
+                    "adset_id":        d.get("adset_id", ""),
+                    "campaign_id":     d.get("campaign_id", ""),
+                    "account_id":      clean_id,
+                    "spend":           round(spend, 2),
+                    "revenue":         round(revenue, 2),
+                    "roas":            round(revenue / spend, 2) if spend > 0 else 0.0,
+                    "conversions":     round(conversions, 1),
+                    "impressions":     int(d.get("impressions", 0) or 0),
+                    "clicks":          int(d.get("clicks", 0) or 0),
+                    "ctr":             round(float(d.get("ctr", 0) or 0), 2),
+                    "atc":             round(atc, 1),
+                    "atc_value":       round(atc_value, 2),
+                    "checkout":        round(checkout, 1),
+                    "ad_title": "", "ad_body": "", "creative_type": "",
+                    "thumbnail_url": "", "image_url": "",
+                    "call_to_action": "", "destination_url": "",
+                    "ad_status": "UNKNOWN",
+                    "synced_at": synced_at,
+                })
+
+            # ── 2. Creative details for all ads in this account ────────────
+            ad_meta: Dict[str, Dict] = {}
+            if ad_ids_seen:
+                try:
+                    ads_resp = AdAccount(norm_id).get_ads(
+                        fields=[
+                            "id", "name", "effective_status",
+                            "creative{title,body,object_type,"
+                            "thumbnail_url,image_url,"
+                            "call_to_action_type,link_url,"
+                            "object_story_spec}",
+                        ],
+                        params={"limit": 500},
+                    )
+                    for ad in ads_resp:
+                        ad_d = ad.export_all_data() if hasattr(ad, "export_all_data") else dict(ad)
+                        aid  = ad_d.get("id", "")
+                        if not aid:
+                            continue
+                        cr = ad_d.get("creative") or {}
+                        if hasattr(cr, "export_all_data"):
+                            cr = cr.export_all_data() or {}
+
+                        # Extract thumbnail from object_story_spec if direct field empty
+                        thumb = cr.get("thumbnail_url", "")
+                        img   = cr.get("image_url", "")
+                        oss   = cr.get("object_story_spec") or {}
+                        if hasattr(oss, "export_all_data"):
+                            oss = oss.export_all_data() or {}
+                        if not thumb and not img:
+                            ld = oss.get("link_data") or {}
+                            if hasattr(ld, "export_all_data"):
+                                ld = ld.export_all_data() or {}
+                            thumb = ld.get("picture", "") or ld.get("image_url", "")
+                            vd = oss.get("video_data") or {}
+                            if hasattr(vd, "export_all_data"):
+                                vd = vd.export_all_data() or {}
+                            if not thumb:
+                                thumb = vd.get("thumbnail_url", "")
+
+                        ad_meta[aid] = {
+                            "ad_title":       cr.get("title", "") or ad_d.get("name", ""),
+                            "ad_body":        cr.get("body", ""),
+                            "creative_type":  _creative_type(cr.get("object_type", "")),
+                            "thumbnail_url":  thumb,
+                            "image_url":      img,
+                            "call_to_action": cr.get("call_to_action_type", ""),
+                            "destination_url": cr.get("link_url", ""),
+                            "ad_status":      ad_d.get("effective_status", "UNKNOWN"),
+                        }
+                except Exception as e:
+                    print(f"[creative] get_ads error for {clean_id}: {e}")
+
+            # Merge creative metadata into insight rows
+            for r in insight_rows:
+                meta = ad_meta.get(r["ad_id"])
+                if meta:
+                    for k, v in meta.items():
+                        if v:  # only overwrite if non-empty
+                            r[k] = v
+
+            # ── 3. Cache to ad_daily_metrics ──────────────────────────────
+            if insight_rows:
+                try:
+                    # Upsert in chunks of 200 to avoid payload limits
+                    for i in range(0, len(insight_rows), 200):
+                        supabase.table("ad_daily_metrics").upsert(
+                            insight_rows[i:i + 200],
+                            on_conflict="date,ad_id",
+                        ).execute()
+                except Exception as e:
+                    print(f"[creative] ad_daily_metrics cache error: {e}")
+
+            all_rows.extend(insight_rows)
+
+        except Exception as e:
+            print(f"[creative] Meta ad insights error for {account_id}: {e}")
+
+    return all_rows
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/analysis")
@@ -345,7 +531,7 @@ def get_creative_analysis(
         rows_resp = (
             supabase.table("ad_daily_metrics")
             .select(
-                "ad_id, ad_name, ad_status, adset_id, campaign_id, account_id, "
+                "date, ad_id, ad_name, ad_status, adset_id, campaign_id, account_id, "
                 "spend, revenue, roas, conversions, impressions, clicks, ctr, "
                 "atc, atc_value, checkout, "
                 "ad_title, ad_body, creative_type, thumbnail_url, image_url, "
@@ -357,22 +543,52 @@ def get_creative_analysis(
             .execute()
         )
         rows = rows_resp.data or []
+        synced_from_meta = False
+
+        # If no local data, pull from Meta API and cache it
         if not rows:
-            return {"creatives": [], "summary": {}, "date_from": date_from, "date_to": date_to}
+            print(f"[creative] no ad_daily_metrics for brand {brand_id} {date_from}→{date_to} — pulling from Meta")
+            rows = _fetch_ads_from_meta(account_ids, date_from, date_to)
+            synced_from_meta = bool(rows)
+
+        if not rows:
+            return {"creatives": [], "summary": {}, "date_from": date_from, "date_to": date_to,
+                    "synced_from_meta": False}
 
         # 3. Aggregate per ad_id
         agg = _aggregate_ad_rows(rows)
 
-        # 4. Campaign statuses
+        # 4. Campaign statuses + names
         campaign_ids = list({m["campaign_id"] for m in agg.values() if m["campaign_id"]})
         campaign_status_map: Dict[str, str] = {}
+        campaign_names: Dict[str, str] = {}
         if campaign_ids:
-            cr = supabase.table("campaigns").select("id, status").in_("id", campaign_ids).execute()
-            campaign_status_map = {c["id"]: c.get("status", "UNKNOWN") for c in cr.data or []}
+            # Primary source: campaigns table has both status and name
+            cr = supabase.table("campaigns").select("id, status, name").in_("id", campaign_ids).execute()
+            for c in cr.data or []:
+                cid = c.get("id", "")
+                if cid:
+                    campaign_status_map[cid] = c.get("status") or "UNKNOWN"
+                    if c.get("name"):
+                        campaign_names[cid] = c["name"]
+            # Fallback: campaign_daily_metrics for any names still missing
+            missing = [cid for cid in campaign_ids if cid not in campaign_names]
+            if missing:
+                cn_resp = (
+                    supabase.table("campaign_daily_metrics")
+                    .select("campaign_id, campaign_name")
+                    .in_("campaign_id", missing)
+                    .limit(500)
+                    .execute()
+                )
+                for row in cn_resp.data or []:
+                    cid = row.get("campaign_id", "")
+                    if cid and cid not in campaign_names and row.get("campaign_name"):
+                        campaign_names[cid] = row["campaign_name"]
 
         # 5. Build creative objects; exclude zero-spend
         all_creatives = [
-            _build_creative(ad_id, m, campaign_status_map)
+            _build_creative(ad_id, m, campaign_status_map, campaign_names)
             for ad_id, m in agg.items()
             if m["spend"] > 0
         ]
@@ -454,11 +670,12 @@ def get_creative_analysis(
         }
 
         return {
-            "creatives": all_creatives,
-            "summary":   summary,
-            "date_from": date_from,
-            "date_to":   date_to,
-            "brand_id":  brand_id,
+            "creatives":        all_creatives,
+            "summary":          summary,
+            "date_from":        date_from,
+            "date_to":          date_to,
+            "brand_id":         brand_id,
+            "synced_from_meta": synced_from_meta,
         }
 
     except Exception as e:
