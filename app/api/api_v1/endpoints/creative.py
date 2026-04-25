@@ -283,7 +283,7 @@ def _build_creative(ad_id: str, m: Dict, campaign_status_map: Dict, campaign_nam
         "campaign_status":  campaign_status,
         "is_active":        is_active,
         "active_priority":  active_priority,
-        "creative_type":    m["creative_type"] or "UNKNOWN",
+        "creative_type":    _creative_type_from_obj(m["creative_type"]) or "UNKNOWN",
         "thumbnail_url":    m["thumbnail_url"],
         "image_url":        m["image_url"],
         "ad_title":         m["ad_title"],
@@ -498,18 +498,35 @@ def _fetch_ads_from_meta(
                     "synced_at": synced_at,
                 })
 
-            # ── 2. Creative details + created_time for all ads ─────────────
+            # ── 2. Creative details via proven per-adset metadata fetch ───────
+            # IngestService._fetch_ads_metadata handles SHARE / VIDEO / LINK /
+            # Carousel thumbnail extraction reliably (including effective_object_story_id).
             ad_meta: Dict[str, Dict] = {}
             if insight_rows:
+                from app.services.ingest import IngestService
+
+                # Collect unique adset_ids seen in this account's insights
+                adset_ids = {r["adset_id"] for r in insight_rows if r.get("adset_id")}
+                print(f"[creative] fetching metadata for {len(adset_ids)} adsets")
+                for adset_id in adset_ids:
+                    try:
+                        meta = IngestService._fetch_ads_metadata(adset_id)
+                        ad_meta.update(meta)
+                    except Exception as e:
+                        print(f"[creative] _fetch_ads_metadata error for adset {adset_id}: {e}")
+
+                # Debug: log thumbnail coverage
+                total_ads = len(ad_meta)
+                with_thumb = sum(1 for m in ad_meta.values() if m.get("thumbnail_url") or m.get("image_url"))
+                print(f"[creative] ad_meta: {total_ads} ads, {with_thumb} have thumbnail/image")
+                for aid, m in list(ad_meta.items())[:3]:
+                    print(f"[creative]   ad={aid} type={m.get('creative_type')} thumb={bool(m.get('thumbnail_url'))} img={bool(m.get('image_url'))} url={m.get('thumbnail_url','')[:60]}")
+
+                # Separately fetch created_time + effective_status for all ads
+                # (lightweight call — just IDs and timestamps, no creative expansion)
                 try:
                     ads_resp = AdAccount(norm_id).get_ads(
-                        fields=[
-                            "id", "name", "effective_status", "created_time",
-                            "creative{title,body,object_type,"
-                            "thumbnail_url,image_url,"
-                            "call_to_action_type,link_url,"
-                            "object_story_spec}",
-                        ],
+                        fields=["id", "effective_status", "created_time"],
                         params={"limit": 500},
                     )
                     for ad in ads_resp:
@@ -517,25 +534,24 @@ def _fetch_ads_from_meta(
                         aid  = ad_d.get("id", "")
                         if not aid:
                             continue
-                        cr            = _safe_d(ad_d.get("creative"))
-                        thumb, img    = _extract_thumb(cr)
-                        created_time  = ad_d.get("created_time", "")
-                        # Normalise created_time to YYYY-MM-DD
-                        created_date  = str(created_time)[:10] if created_time else ""
-
-                        ad_meta[aid] = {
-                            "ad_title":       cr.get("title", "") or ad_d.get("name", ""),
-                            "ad_body":        cr.get("body", ""),
-                            "creative_type":  _creative_type_from_obj(cr.get("object_type", "")),
-                            "thumbnail_url":  thumb,
-                            "image_url":      img,
-                            "call_to_action": cr.get("call_to_action_type", ""),
-                            "destination_url": cr.get("link_url", ""),
-                            "ad_status":      ad_d.get("effective_status", "UNKNOWN"),
-                            "created_date":   created_date,
-                        }
+                        created_date = str(ad_d.get("created_time", ""))[:10]
+                        status       = ad_d.get("effective_status", "UNKNOWN")
+                        if aid in ad_meta:
+                            ad_meta[aid]["created_date"] = created_date
+                            # Only override status if _fetch_ads_metadata left it as UNKNOWN
+                            if not ad_meta[aid].get("ad_status") or ad_meta[aid]["ad_status"] == "UNKNOWN":
+                                ad_meta[aid]["ad_status"] = status
+                        else:
+                            # Ad had no creative data (e.g. adset not in range) — still record dates
+                            ad_meta[aid] = {
+                                "ad_title": "", "ad_body": "", "creative_type": "",
+                                "thumbnail_url": "", "image_url": "",
+                                "call_to_action": "", "destination_url": "",
+                                "ad_status": status,
+                                "created_date": created_date,
+                            }
                 except Exception as e:
-                    print(f"[creative] get_ads error for {clean_id}: {e}")
+                    print(f"[creative] get_ads (dates) error for {clean_id}: {e}")
 
             # Merge creative metadata into insight rows
             for r in insight_rows:
@@ -687,9 +703,16 @@ def get_creative_analysis(
         missing_thumb_adsets = {c["adset_id"] for c in missing_thumb_ads if c.get("adset_id")}
         if missing_thumb_adsets:
             from app.services.ingest import IngestService
-            for adset_id in list(missing_thumb_adsets)[:10]:   # cap at 10 per request
+            for adset_id in list(missing_thumb_adsets)[:10]:
                 background_tasks.add_task(IngestService.backfill_ad_creatives, adset_id)
         missing_thumbnails_count = len(missing_thumb_ads)
+
+        # Debug: log thumbnail coverage in final response
+        total_c = len(all_creatives)
+        with_thumb_c = sum(1 for c in all_creatives if c.get("thumbnail_url") or c.get("image_url"))
+        print(f"[creative] response: {total_c} creatives, {with_thumb_c} have thumbnail, {missing_thumbnails_count} missing")
+        for c in all_creatives[:3]:
+            print(f"[creative]   ad={c['ad_id']} type={c['creative_type']} thumb={bool(c.get('thumbnail_url'))} url={c.get('thumbnail_url','')[:60]}")
 
         # 6. Load cached scores (skip if force_reanalyze)
         cached: Dict[str, Dict] = {}
