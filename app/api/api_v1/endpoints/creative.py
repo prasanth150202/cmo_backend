@@ -120,56 +120,76 @@ def _compute_performance_scores(creatives: List[Dict]) -> List[Dict]:
 
 # ── AI scoring ────────────────────────────────────────────────────────────────
 
+def _build_score_prompt(creative: Dict) -> str:
+    m = creative["metrics"]
+    return (
+        f"Analyze this Meta ad creative and score it 0–100.\n\n"
+        f"Ad: {creative.get('ad_name', 'Unknown')}\n"
+        f"Type: {creative.get('creative_type', 'Unknown')}\n\n"
+        f"Metrics:\n"
+        f"- ROAS: {m['roas']:.2f}x (industry avg ~2.5x)\n"
+        f"- CTR: {m['ctr']:.2f}%\n"
+        f"- CPM: ₹{m['cpm']:.0f} (lower is better)\n"
+        f"- Hook/1K: {m['hook_rate']:.2f} (ATC+Checkout per 1 000 impressions)\n"
+        f"- Conversions: {m['conversions']:.0f}\n"
+        f"- Spend: ₹{m['spend']:,.0f}\n"
+        f"- Revenue: ₹{m['revenue']:,.0f}\n\n"
+        f"Formula performance score: {creative.get('performance_score', 0):.1f}/100\n\n"
+        "Consider statistical significance of conversions vs spend, "
+        "full-funnel health, and creative type. "
+        "Respond in exactly this format:\n"
+        "SCORE: [0-100]\n"
+        "REASON: [one sentence, max 15 words]"
+    )
+
+
+def _parse_score_response(text: str) -> tuple[float, str]:
+    score, reason = 50.0, "AI analysis complete."
+    for line in text.splitlines():
+        if line.startswith("SCORE:"):
+            try:
+                score = max(0.0, min(100.0, float(line[6:].strip())))
+            except ValueError:
+                pass
+        elif line.startswith("REASON:"):
+            reason = line[7:].strip()
+    return round(score, 1), reason
+
+
 def _ai_score_with_claude(creative: Dict) -> tuple[float, str]:
-    """Call Claude API. Returns (score, reasoning). Falls back gracefully."""
-    try:
-        import anthropic
-        from app.core.config import settings
-        if not settings.ANTHROPIC_API_KEY:
-            raise ValueError("no key")
+    """Try Claude → GPT → rule-based fallback."""
+    from app.core.config import settings
 
-        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        m = creative["metrics"]
-        prompt = (
-            f"Analyze this Meta ad creative and score it 0–100.\n\n"
-            f"Ad: {creative.get('ad_name', 'Unknown')}\n"
-            f"Type: {creative.get('creative_type', 'Unknown')}\n\n"
-            f"Metrics:\n"
-            f"- ROAS: {m['roas']:.2f}x (industry avg ~2.5x)\n"
-            f"- CTR: {m['ctr']:.2f}%\n"
-            f"- CPM: ₹{m['cpm']:.0f} (lower is better)\n"
-            f"- Hook/1K: {m['hook_rate']:.2f} (ATC+Checkout per 1 000 impressions)\n"
-            f"- Conversions: {m['conversions']:.0f}\n"
-            f"- Spend: ₹{m['spend']:,.0f}\n"
-            f"- Revenue: ₹{m['revenue']:,.0f}\n\n"
-            f"Formula performance score: {creative.get('performance_score', 0):.1f}/100\n\n"
-            "Consider statistical significance of conversions vs spend, "
-            "full-funnel health, and creative type. "
-            "Respond in exactly this format:\n"
-            "SCORE: [0-100]\n"
-            "REASON: [one sentence, max 15 words]"
-        )
+    # ── 1. Claude ────────────────────────────────────────────────────────────
+    if settings.ANTHROPIC_API_KEY:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=80,
+                messages=[{"role": "user", "content": _build_score_prompt(creative)}],
+            )
+            return _parse_score_response(resp.content[0].text.strip())
+        except Exception as e:
+            print(f"[creative] claude score error: {e}")
 
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=80,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = resp.content[0].text.strip()
-        score, reason = 50.0, "AI analysis complete."
-        for line in text.splitlines():
-            if line.startswith("SCORE:"):
-                try:
-                    score = max(0.0, min(100.0, float(line[6:].strip())))
-                except ValueError:
-                    pass
-            elif line.startswith("REASON:"):
-                reason = line[7:].strip()
-        return round(score, 1), reason
+    # ── 2. GPT fallback ──────────────────────────────────────────────────────
+    if settings.OPENAI_API_KEY:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                max_tokens=80,
+                messages=[{"role": "user", "content": _build_score_prompt(creative)}],
+            )
+            return _parse_score_response(resp.choices[0].message.content.strip())
+        except Exception as e:
+            print(f"[creative] gpt score error: {e}")
 
-    except Exception as e:
-        print(f"[creative] claude score error: {e}")
-        return _ai_score_fallback(creative)
+    # ── 3. Rule-based last resort ────────────────────────────────────────────
+    return _ai_score_fallback(creative)
 
 
 def _ai_score_fallback(creative: Dict) -> tuple[float, str]:
