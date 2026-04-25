@@ -558,11 +558,13 @@ def get_creative_analysis(
     date_from:        Optional[str] = Query(default=None),
     date_to:          Optional[str] = Query(default=None),
     force_reanalyze:  bool          = Query(default=False),
+    force_sync:       bool          = Query(default=False),
 ) -> Any:
     """
     Full creative analysis for a brand.
     Returns ranked creatives with performance + AI scores.
-    Scores are cached in creative_scores for 6 hours; force_reanalyze bypasses the cache.
+    Scores are cached in creative_scores for 6 hours; force_reanalyze bypasses the score cache.
+    force_sync=true skips the DB metrics cache and re-pulls everything from Meta API.
     """
     if not date_from or not date_to:
         date_from, date_to = _default_dates()
@@ -574,27 +576,41 @@ def get_creative_analysis(
         if not account_ids:
             return {"creatives": [], "summary": {}, "date_from": date_from, "date_to": date_to}
 
-        # 2. Ad daily metrics for date range
-        rows_resp = (
-            supabase.table("ad_daily_metrics")
-            .select(
-                "date, ad_id, ad_name, ad_status, adset_id, campaign_id, account_id, "
-                "spend, revenue, roas, conversions, impressions, clicks, ctr, "
-                "atc, atc_value, checkout, "
-                "ad_title, ad_body, creative_type, thumbnail_url, image_url, "
-                "call_to_action, destination_url"
-            )
-            .in_("account_id", account_ids)
-            .gte("date", date_from)
-            .lte("date", date_to)
-            .execute()
-        )
-        rows = rows_resp.data or []
+        rows: List[Dict] = []
         synced_from_meta = False
 
-        # If no local data, pull from Meta API and cache it
-        if not rows:
-            print(f"[creative] no ad_daily_metrics for brand {brand_id} {date_from}→{date_to} — pulling from Meta")
+        if not force_sync:
+            # 2. Ad daily metrics from DB for the date range
+            rows_resp = (
+                supabase.table("ad_daily_metrics")
+                .select(
+                    "date, ad_id, ad_name, ad_status, adset_id, campaign_id, account_id, "
+                    "spend, revenue, roas, conversions, impressions, clicks, ctr, "
+                    "atc, atc_value, checkout, "
+                    "ad_title, ad_body, creative_type, thumbnail_url, image_url, "
+                    "call_to_action, destination_url"
+                )
+                .in_("account_id", account_ids)
+                .gte("date", date_from)
+                .lte("date", date_to)
+                .execute()
+            )
+            rows = rows_resp.data or []
+
+            # Per-account Meta fallback: pull from Meta for accounts with no DB data.
+            # (Avoids the case where one adset was synced before but most active ads are missing.)
+            accounts_with_data = {r["account_id"] for r in rows}
+            accounts_missing   = [aid for aid in account_ids if aid not in accounts_with_data]
+            if accounts_missing:
+                print(f"[creative] no ad_daily_metrics for accounts {accounts_missing} — pulling from Meta")
+                meta_rows = _fetch_ads_from_meta(accounts_missing, date_from, date_to)
+                if meta_rows:
+                    rows.extend(meta_rows)
+                    synced_from_meta = True
+
+        else:
+            # force_sync: skip DB entirely, re-pull all accounts from Meta
+            print(f"[creative] force_sync for brand {brand_id} — pulling all from Meta")
             rows = _fetch_ads_from_meta(account_ids, date_from, date_to)
             synced_from_meta = bool(rows)
 
