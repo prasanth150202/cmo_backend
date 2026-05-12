@@ -731,7 +731,36 @@ def get_campaign_adsets(
             if datetime.now(last_sync.tzinfo) - last_sync > timedelta(hours=6):
                 is_stale = True
 
-    # Return whatever we have (or empty) while sync runs in background
+    # If no data OR stale, trigger background sync then return what we have
+    if (not rows or is_stale) and background_tasks is not None:
+        from app.services.ingest import IngestService
+        try:
+            camp_resp = (
+                supabase.table("campaigns")
+                .select("account_id")
+                .eq("id", campaign_id)
+                .limit(1)
+                .execute()
+            )
+            account_id = camp_resp.data[0]["account_id"] if camp_resp.data else ""
+            if not account_id:
+                # fallback: look up via campaign_daily_metrics
+                cdm_resp = (
+                    supabase.table("campaign_daily_metrics")
+                    .select("account_id")
+                    .eq("campaign_id", campaign_id)
+                    .limit(1)
+                    .execute()
+                )
+                account_id = cdm_resp.data[0]["account_id"] if cdm_resp.data else ""
+            if account_id:
+                background_tasks.add_task(
+                    IngestService.sync_adset_daily_metrics,
+                    campaign_id, account_id, date_from, date_to, not is_stale,
+                )
+        except Exception as e:
+            print(f"[adsets-get] background sync lookup error: {e}")
+
     return {"data": agg_result["data"], "last_synced": agg_result["last_synced"]}
 
 
